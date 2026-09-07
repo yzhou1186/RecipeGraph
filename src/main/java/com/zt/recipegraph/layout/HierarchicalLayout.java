@@ -1,5 +1,6 @@
 package com.zt.recipegraph.layout;
 
+import com.zt.recipegraph.RecipeGraphConfig;
 import com.zt.recipegraph.graph.GraphEdge;
 import com.zt.recipegraph.graph.GraphNode;
 import com.zt.recipegraph.graph.PatternGraph;
@@ -102,9 +103,11 @@ public final class HierarchicalLayout {
         List<List<Integer>> sccs = tarjanSCC(metaAdj);
         int totalModules = boxes.size();
         long totalNodes = graph.getNodeCount();
-        int moduleCap = totalModules <= 8
+        // moduleCap: scaled adaptive value, but capped by user config maxModuleSize
+        int dynamicModuleCap = totalModules <= 8
             ? totalModules
             : Math.max(4, (int) Math.round(Math.sqrt(totalModules) * 1.6));
+        int moduleCap = Math.min(dynamicModuleCap, RecipeGraphConfig.maxModuleSize());
         long nodeCap = totalNodes <= 60
             ? totalNodes
             : Math.max(60, Math.round(Math.sqrt(totalNodes) * 9.0));
@@ -157,7 +160,12 @@ public final class HierarchicalLayout {
             placeInternal(b, plans.get(b.id));
         }
 
-        // ===== 7. route every pattern edge =====
+        // ===== 6.5 post-layout AABB collision separation =====
+        // Runs after intra-box placement but before edge routing so edge anchors
+        // use the separated positions. Controlled by RecipeGraphConfig.aabbIterations().
+        separateNodes(graph.getNodes(), RecipeGraphConfig.aabbIterations());
+
+        // ===== 7. route every pattern edges =====
         routeEdges(metaBack);
 
         // world bounds normalisation: shift everything into positive space with margin
@@ -772,6 +780,100 @@ public final class HierarchicalLayout {
                 p[i] += sx;
                 p[i + 1] += sy;
             }
+        }
+    }
+
+    // ===================================================================
+    // Post-layout AABB collision separation
+    // ===================================================================
+
+    /**
+     * Iteratively pushes overlapping recipe cards apart in world-space. Runs {@code iterations}
+     * passes; more passes give cleaner separation at the cost of layout time. Since nodes are
+     * already placed inside their module boxes with cumulative stacking (no intra-box overlaps
+     * are produced by placeInternal), this mainly cleans up small floating-point overlaps and
+     * any cross-module boundary nudges caused by box placement rounding.
+     *
+     * <p>Configurable via {@link RecipeGraphConfig#aabbIterations()} (range 50–200, default 50).
+     */
+    private static void separateNodes(java.util.Collection<GraphNode> nodes, int iterations) {
+        int n = nodes.size();
+        if (n < 2 || iterations <= 0) return;
+
+        GraphNode[] arr = nodes.toArray(new GraphNode[0]);
+
+        // Precompute AABB half-extents (cards vary in height with port count)
+        double[] halfW = new double[n];
+        double[] halfH = new double[n];
+        for (int i = 0; i < n; i++) {
+            GraphNode node = arr[i];
+            halfW[i] = node.width * 0.5 + 2.0;   // 2px extra margin for comfort
+            halfH[i] = node.height * 0.5 + 2.0;
+        }
+
+        // Spatial hash grid for O(kn) instead of O(n²) per iteration
+        double cellSize = Math.max(CARD_W, PORT_ROW * 4);
+        java.util.HashMap<Long, List<Integer>> grid = new java.util.HashMap<>();
+
+        for (int iter = 0; iter < iterations; iter++) {
+            // Rebuild spatial hash each pass — nodes move
+            grid.clear();
+            for (int i = 0; i < n; i++) {
+                GraphNode node = arr[i];
+                long cx = (long) Math.floor(node.x / cellSize);
+                long cy = (long) Math.floor(node.y / cellSize);
+                long key = cx * 73856093L ^ cy * 19349663L;
+                grid.computeIfAbsent(key, k -> new ArrayList<>()).add(i);
+            }
+
+            double totalDx = 0, totalDy = 0;
+
+            for (Map.Entry<Long, List<Integer>> en : grid.entrySet()) {
+                long key = en.getKey();
+                long cx = key / 73856093L;
+                long cy = key % 73856093L;
+
+                // Check this cell and 8 neighbours
+                for (int dx = -1; dx <= 1; dx++) {
+                    for (int dy = -1; dy <= 1; dy++) {
+                        long nk = (cx + dx) * 73856093L ^ (cy + dy) * 19349663L;
+                        List<Integer> other = grid.get(nk);
+                        if (other == null) continue;
+
+                        List<Integer> here = en.getValue();
+                        for (int i : here) {
+                            GraphNode ni = arr[i];
+                            for (int j : other) {
+                                if (j <= i) continue; // avoid double processing
+                                GraphNode nj = arr[j];
+
+                                // AABB overlap test
+                                double ox = halfW[i] + halfW[j] - Math.abs(ni.x - nj.x);
+                                double oy = halfH[i] + halfH[j] - Math.abs(ni.y - nj.y);
+                                if (ox <= 0 || oy <= 0) continue; // no overlap
+
+                                // Push apart along the axis of smaller overlap
+                                if (ox < oy) {
+                                    double sign = (ni.x < nj.x) ? -1 : 1;
+                                    double push = ox * 0.5;
+                                    ni.x += sign * push;
+                                    nj.x -= sign * push;
+                                    totalDx += push;
+                                } else {
+                                    double sign = (ni.y < nj.y) ? -1 : 1;
+                                    double push = oy * 0.5;
+                                    ni.y += sign * push;
+                                    nj.y -= sign * push;
+                                    totalDy += push;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Early exit if the layout has stabilised
+            if (totalDx < 0.1 && totalDy < 0.1) break;
         }
     }
 }

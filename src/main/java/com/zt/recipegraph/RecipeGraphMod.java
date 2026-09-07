@@ -8,6 +8,7 @@ import com.zt.recipegraph.registry.ModMenus;
 
 import net.minecraft.world.item.CreativeModeTabs;
 import net.neoforged.bus.api.IEventBus;
+import net.neoforged.fml.ModContainer;
 import net.neoforged.fml.common.Mod;
 import net.neoforged.neoforge.capabilities.RegisterCapabilitiesEvent;
 import net.neoforged.neoforge.common.NeoForge;
@@ -30,7 +31,7 @@ public final class RecipeGraphMod {
     public static final org.slf4j.Logger LOGGER =
         com.mojang.logging.LogUtils.getLogger();
 
-    public RecipeGraphMod(IEventBus modBus) {
+    public RecipeGraphMod(ModContainer container, IEventBus modBus) {
         // Register deferred registries
         ModItems.ITEMS.register(modBus);
         ModBlocks.BLOCKS.register(modBus);
@@ -45,6 +46,9 @@ public final class RecipeGraphMod {
 
         // Client-side screen registration
         ModMenus.registerScreens(modBus);
+
+        // Config — register directly via ModContainer (NeoForge 1.21.x API)
+        RecipeGraphConfig.register(container);
 
         // Network channel
         PacketHandler.register(modBus);

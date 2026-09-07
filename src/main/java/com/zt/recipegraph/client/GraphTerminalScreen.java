@@ -54,6 +54,14 @@ public class GraphTerminalScreen extends Screen implements MenuAccess<GraphTermi
     private List<GraphNode> searchMatches = List.of();
     private int searchIndex = 0;
 
+    // Function menu popup
+    private boolean showFunctionMenu = false;
+    /** Currently active layout mode name (shown in popup and header). */
+    private String layoutModeName = "recipegraph.layout_mode.recipe_material";
+    private static final String[] LAYOUT_MODES = {
+        "recipegraph.layout_mode.recipe_material"  // Recipe-Material mode (default)
+    };
+
     public GraphTerminalScreen(GraphTerminalMenu menu, Inventory inv, Component title) {
         super(title);
         this.menu = menu;
@@ -78,20 +86,15 @@ public class GraphTerminalScreen extends Screen implements MenuAccess<GraphTermi
         view.setViewport(this.width - PADDING_X * 2, this.height - PADDING_TOP - PADDING_BOTTOM);
         refreshFromState();
 
-        // Buttons stacked vertically in the top-right corner (growing downward)
+        // Single "Functions" button in the top-right corner; clicking it toggles
+        // a popup menu listing all actions
         int bw = 96;
-        int gap = 3;
         int bx = this.width - 4 - bw;
         int by = 4;
-
-        by = addButtonV(bx, by, bw, "recipegraph.button.rebuild",
-            b -> getMenu().requestRebuild(), gap);
-        by = addButtonV(bx, by, bw, "recipegraph.button.cluster_toggle",
-            b -> view.toggleClusters(), gap);
-        by = addButtonV(bx, by, bw, "recipegraph.button.export_svg",
-            b -> GraphExporter.exportSvg(view), gap);
-        addButtonV(bx, by, bw, "recipegraph.button.export_json",
-            b -> GraphExporter.exportJson(view), gap);
+        this.addRenderableWidget(Button.builder(
+            Component.translatable("recipegraph.button.functions"),
+            b -> { showFunctionMenu = !showFunctionMenu; })
+            .pos(bx, by).size(bw, 18).build());
 
         // Ctrl+F search box (top-centre, hidden until toggled)
         searchBox = new EditBox(this.font, this.width / 2 - 120, 6, 240, 16,
@@ -105,13 +108,6 @@ public class GraphTerminalScreen extends Screen implements MenuAccess<GraphTermi
             searchIndex = 0;
         });
         this.addRenderableWidget(searchBox);
-    }
-
-    private int addButtonV(int x, int y, int w, String langKey,
-                           Button.OnPress onPress, int gap) {
-        this.addRenderableWidget(Button.builder(Component.translatable(langKey), onPress)
-            .pos(x, y).size(w, 18).build());
-        return y + 18 + gap;
     }
 
     public void refreshFromState() {
@@ -222,6 +218,118 @@ public class GraphTerminalScreen extends Screen implements MenuAccess<GraphTermi
             int w = this.font.width(line);
             g.drawString(this.font, line, this.width - 6 - w, helpTop + i * helpLineH, 0xFF7A8290);
         }
+
+        // Function menu popup (drawn last so it sits on top)
+        if (showFunctionMenu) {
+            renderFunctionMenu(g, mouseX, mouseY);
+        }
+    }
+
+    // === Function menu popup ===
+
+    private static final int MENU_ITEM_W = 160;
+    private static final int MENU_ITEM_H = 18;
+    private static final int MENU_BG_PAD = 2;
+    private static final String[] MENU_ITEM_KEYS = {
+        "recipegraph.button.rebuild",
+        "recipegraph.button.cluster_toggle",
+        null, // separator
+        "recipegraph.button.layout_mode",
+        "recipegraph.button.export_svg",
+        "recipegraph.button.export_json"
+    };
+
+    /** Returns the screen coordinates of the menu's anchor (top-right, just below the Functions button). */
+    private int menuAnchorX() {
+        return this.width - 4 - 96; // same x as the Functions button
+    }
+    private int menuAnchorY() {
+        return 4 + 18 + 2; // below Functions button with small gap
+    }
+
+    private void renderFunctionMenu(GuiGraphics g, int mouseX, int mouseY) {
+        int ax = menuAnchorX();
+        int ay = menuAnchorY();
+        int totalH = MENU_ITEM_KEYS.length * MENU_ITEM_H + MENU_BG_PAD * 2;
+        // Clip to window bottom
+        if (ay + totalH > this.height - 4) {
+            ay = this.height - 4 - totalH;
+        }
+        // Background
+        g.fill(ax - MENU_BG_PAD, ay - MENU_BG_PAD,
+            ax + MENU_ITEM_W + MENU_BG_PAD, ay + totalH + MENU_BG_PAD,
+            0xFF1C2230);
+        g.renderOutline(ax - MENU_BG_PAD, ay - MENU_BG_PAD,
+            MENU_ITEM_W + MENU_BG_PAD * 2, totalH + MENU_BG_PAD * 2,
+            0xFF4A5568);
+        for (int i = 0; i < MENU_ITEM_KEYS.length; i++) {
+            int y = ay + i * MENU_ITEM_H;
+            String key = MENU_ITEM_KEYS[i];
+            if (key == null) {
+                // separator
+                g.fill(ax + 4, y + MENU_ITEM_H / 2 - 1,
+                    ax + MENU_ITEM_W - 4, y + MENU_ITEM_H / 2 + 1,
+                    0xFF374151);
+                continue;
+            }
+            boolean hovered = mouseX >= ax && mouseX <= ax + MENU_ITEM_W
+                && mouseY >= y && mouseY <= y + MENU_ITEM_H;
+            int bgColor = hovered ? 0xFF3B4758 : 0x00000000;
+            if (bgColor != 0) g.fill(ax, y, ax + MENU_ITEM_W, y + MENU_ITEM_H, bgColor);
+
+            String label = Component.translatable(key).getString();
+            // Special: layout mode item shows current mode name
+            if ("recipegraph.button.layout_mode".equals(key)) {
+                label = label + ": " + Component.translatable(layoutModeName).getString();
+            }
+            int textY = y + (MENU_ITEM_H - this.font.lineHeight) / 2;
+            g.drawString(this.font, label, ax + 6, textY, hovered ? 0xFFFFFFFF : 0xFFD1D5DB);
+        }
+    }
+
+    /** Handles a click inside the function menu popup. Returns true if consumed. */
+    private boolean handleFunctionMenuClick(double mouseX, double mouseY) {
+        if (!showFunctionMenu) return false;
+        int ax = menuAnchorX();
+        int ay = menuAnchorY();
+        int totalH = MENU_ITEM_KEYS.length * MENU_ITEM_H + MENU_BG_PAD * 2;
+        if (ay + totalH > this.height - 4) ay = this.height - 4 - totalH;
+        boolean clickedInside = mouseX >= ax - MENU_BG_PAD && mouseX <= ax + MENU_ITEM_W + MENU_BG_PAD
+            && mouseY >= ay - MENU_BG_PAD && mouseY <= ay + totalH + MENU_BG_PAD;
+        boolean clickedOutside = !clickedInside;
+        showFunctionMenu = false; // close on any click (inside handled below)
+        if (clickedOutside) return true; // consume the click
+        // Find which item
+        for (int i = 0; i < MENU_ITEM_KEYS.length; i++) {
+            int y = ay + i * MENU_ITEM_H;
+            if (mouseX >= ax && mouseX <= ax + MENU_ITEM_W && mouseY >= y && mouseY <= y + MENU_ITEM_H) {
+                String key = MENU_ITEM_KEYS[i];
+                if (key == null) break; // separator
+                switch (key) {
+                    case "recipegraph.button.rebuild" -> getMenu().requestRebuild();
+                    case "recipegraph.button.cluster_toggle" -> view.toggleClusters();
+                    case "recipegraph.button.layout_mode" -> cycleLayoutMode();
+                    case "recipegraph.button.export_svg" -> GraphExporter.exportSvg(view);
+                    case "recipegraph.button.export_json" -> GraphExporter.exportJson(view);
+                }
+                return true;
+            }
+        }
+        return true; // consume
+    }
+
+    private void cycleLayoutMode() {
+        // Only one mode exists right now, but the machinery is ready for more.
+        if (LAYOUT_MODES.length <= 1) {
+            ClientToast.push(Component.translatable("recipegraph.layout_mode.only_one"));
+            return;
+        }
+        for (int i = 0; i < LAYOUT_MODES.length; i++) {
+            if (LAYOUT_MODES[i].equals(layoutModeName)) {
+                layoutModeName = LAYOUT_MODES[(i + 1) % LAYOUT_MODES.length];
+                break;
+            }
+        }
     }
 
     private void renderGraph(GuiGraphics g, int mouseX, int mouseY) {
@@ -259,6 +367,10 @@ public class GraphTerminalScreen extends Screen implements MenuAccess<GraphTermi
 
     @Override
     public boolean mouseClicked(double mouseX, double mouseY, int button) {
+        // Function menu popup takes priority over canvas interaction
+        if (showFunctionMenu) {
+            if (handleFunctionMenuClick(mouseX, mouseY)) return true;
+        }
         if (inCanvas((int) mouseX, (int) mouseY) && !isOverButton(mouseX, mouseY)) {
             // Left click on a RIGHT-side INPUT port: jump to that material's crafting recipe
             if (button == 0 && hit.portKey() != null) {
@@ -461,6 +573,17 @@ public class GraphTerminalScreen extends Screen implements MenuAccess<GraphTermi
     }
 
     private boolean isOverButton(double x, double y) {
+        // Also detect popup menu region so canvas clicks don't fire while menu is open
+        if (showFunctionMenu) {
+            int ax = menuAnchorX();
+            int ay = menuAnchorY();
+            int totalH = MENU_ITEM_KEYS.length * MENU_ITEM_H + MENU_BG_PAD * 2;
+            if (ay + totalH > this.height - 4) ay = this.height - 4 - totalH;
+            if (x >= ax - MENU_BG_PAD && x <= ax + MENU_ITEM_W + MENU_BG_PAD
+                && y >= ay - MENU_BG_PAD && y <= ay + totalH + MENU_BG_PAD) {
+                return true;
+            }
+        }
         return this.children().stream().anyMatch(c -> {
             if (!(c instanceof Button b)) return false;
             return x >= b.getX() && x <= b.getX() + b.getWidth()

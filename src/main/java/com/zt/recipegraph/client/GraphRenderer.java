@@ -143,42 +143,29 @@ public final class GraphRenderer {
         String hoverKey = hoverPortKey;
         boolean anyHover = hoverKey != null || hoveredNode != null || hoveredEdge >= 0;
 
-        // 3. Edges as routed polylines; association highlight by material key
+        // 3a. CROSS-MODULE edges first (bottom layer) — these route outside boxes and
+        // must not obscure intra-module edges drawn inside boxes on top
         List<GraphEdge> edges = graph.getEdges();
         for (int ei = 0; ei < edges.size(); ei++) {
             GraphEdge e = edges.get(ei);
             GraphNode a = e.getFrom();
             GraphNode b2 = e.getTo();
             boolean sameModule = (a.getCluster() == b2.getCluster() && a.getCluster() >= 0);
-            int base = sameModule ? EDGE_SAME : EDGE_CROSS;
-            boolean highlighted =
-                    (hoverKey != null && hoverKey.equals(e.getKeyId()))
-                    || (hoveredNode != null && (a == hoveredNode || b2 == hoveredNode))
-                    || hoveredEdge == ei;
-            int color = highlighted ? EDGE_HIGHLIGHT
-                    : (anyHover ? ((base & 0x00FFFFFF) | (DIM_ALPHA << 24)) : base);
-            double[] pts = layout.routeOf(ei);
-            if (pts == null || pts.length < 4) {
-                pts = new double[]{
-                    a.x, a.y, b2.x, b2.y
-                };
-            }
-            int n = pts.length / 2;
-            for (int i = 0; i < n - 1; i++) {
-                int x1 = (int) (offX + pts[i * 2] * zoom);
-                int y1 = (int) (offY + pts[i * 2 + 1] * zoom);
-                int x2 = (int) (offX + pts[i * 2 + 2] * zoom);
-                int y2 = (int) (offY + pts[i * 2 + 3] * zoom);
-                if (Math.max(x1, x2) < canvasX0 || Math.min(x1, x2) > canvasX1) continue;
-                if (Math.max(y1, y2) < canvasY0 || Math.min(y1, y2) > canvasY1) continue;
-                drawLine(g, x1, y1, x2, y2, color);
-                if (i == n - 2) {
-                    double lastLen = Math.max(Math.abs(x2 - x1), Math.abs(y2 - y1));
-                    if (lastLen >= 8) {
-                        drawArrowHead(g, x1, y1, x2, y2, color);
-                    }
-                }
-            }
+            if (sameModule) continue; // draw intra-module later
+            drawEdge(g, font, a, b2, e, ei, edges, layout, offX, offY, zoom,
+                canvasX0, canvasY0, canvasX1, canvasY1, hoverKey, hoveredNode, hoveredEdge, anyHover, false);
+        }
+
+        // 3b. INTRA-MODULE edges on top (they live inside boxes and must be visible
+        // above any cross-module edges that might happen to cross over)
+        for (int ei = 0; ei < edges.size(); ei++) {
+            GraphEdge e = edges.get(ei);
+            GraphNode a = e.getFrom();
+            GraphNode b2 = e.getTo();
+            boolean sameModule = (a.getCluster() == b2.getCluster() && a.getCluster() >= 0);
+            if (!sameModule) continue;
+            drawEdge(g, font, a, b2, e, ei, edges, layout, offX, offY, zoom,
+                canvasX0, canvasY0, canvasX1, canvasY1, hoverKey, hoveredNode, hoveredEdge, anyHover, true);
         }
 
         // 4. Recipe cards with port chips
@@ -464,6 +451,42 @@ public final class GraphRenderer {
         drawLine(g, startX, startY, endX, endY, color);
         drawLine(g, endX, endY, ax1, ay1, color);
         drawLine(g, endX, endY, ax2, ay2, color);
+    }
+
+    /** Draws one edge as orthogonal polylines. Used for both cross-module and intra-module passes. */
+    private static void drawEdge(GuiGraphics g, Font font, GraphNode a, GraphNode b2, GraphEdge e, int ei,
+                                  List<GraphEdge> edges, LayoutResult layout,
+                                  double offX, double offY, double zoom,
+                                  int canvasX0, int canvasY0, int canvasX1, int canvasY1,
+                                  String hoverKey, GraphNode hoveredNode, int hoveredEdge, boolean anyHover,
+                                  boolean sameModule) {
+        int base = sameModule ? EDGE_SAME : EDGE_CROSS;
+        boolean highlighted =
+                (hoverKey != null && hoverKey.equals(e.getKeyId()))
+                || (hoveredNode != null && (a == hoveredNode || b2 == hoveredNode))
+                || hoveredEdge == ei;
+        int color = highlighted ? EDGE_HIGHLIGHT
+                : (anyHover ? ((base & 0x00FFFFFF) | (DIM_ALPHA << 24)) : base);
+        double[] pts = layout.routeOf(ei);
+        if (pts == null || pts.length < 4) {
+            pts = new double[]{a.x, a.y, b2.x, b2.y};
+        }
+        int n = pts.length / 2;
+        for (int i = 0; i < n - 1; i++) {
+            int x1 = (int) (offX + pts[i * 2] * zoom);
+            int y1 = (int) (offY + pts[i * 2 + 1] * zoom);
+            int x2 = (int) (offX + pts[i * 2 + 2] * zoom);
+            int y2 = (int) (offY + pts[i * 2 + 3] * zoom);
+            if (Math.max(x1, x2) < canvasX0 || Math.min(x1, x2) > canvasX1) continue;
+            if (Math.max(y1, y2) < canvasY0 || Math.min(y1, y2) > canvasY1) continue;
+            drawLine(g, x1, y1, x2, y2, color);
+            if (i == n - 2) {
+                double lastLen = Math.max(Math.abs(x2 - x1), Math.abs(y2 - y1));
+                if (lastLen >= 8) {
+                    drawArrowHead(g, x1, y1, x2, y2, color);
+                }
+            }
+        }
     }
 
     private static void drawLine(GuiGraphics g, int x1, int y1, int x2, int y2, int color) {

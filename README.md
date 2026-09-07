@@ -17,6 +17,17 @@ Visualizes Applied Energistics 2 crafting patterns as a clustered dependency gra
 | Applied Energistics 2 | 19.x |
 | Java | 21 |
 
+## Configuration
+
+The mod exposes two common-side config values, written to `<config>/recipegraph.toml` and editable in-game via NeoForge's Mod List → Config button:
+
+| Key | Type | Range | Default | Description |
+|---|---|---|---|---|
+| `maxModuleSize` | int | 3–100 | 42 | Maximum modules allowed in one merged super-component (SCC condensation cap). Larger values pack more cycles into one box; smaller values keep SCCs compact but may leave mega-SCCs unmerged. |
+| `aabbIterations` | int | 50–200 | 50 | Post-layout AABB collision-separation iterations. More passes give cleaner card separation at the cost of layout time on large graphs. |
+
+Both values are clamped to their declared ranges on read, so manually editing the TOML out-of-bounds is safe. Changes take effect the next time a graph is laid out (Rebuild button or opening the terminal).
+
 ## How It Works
 
 Right-click the Graph Terminal block to open a fullscreen graph of all patterns on the connected ME network. The graph flows **right-to-left**: raw materials on the right, finished products on the left.
@@ -133,6 +144,7 @@ Two-layer layout: meta-graph (modules) + module internals (recipe cards).
 - **Fluid/gas icons:** `AEKeyRendering.drawInGui()` — AE2's registered render handlers (each addon provides its own)
 - **Names:** `key.getDisplayName()` for localized material names
 - **Edges:** orthogonal polylines, bright cyan (intra-module) or dark grey (cross-module), arrowheads at segment ends
+- **Z-order:** cross-module edges are drawn **first** (bottom layer), intra-module edges drawn **on top** so they are never obscured by lines crossing between boxes
 - **Hover:** hovering a port highlights all same-keyId ports + linked edges in bright amber; everything else dims
 - **Click:** left-click an edge -> camera jumps to downstream node; left-click a right-side input port -> jumps to that material's producer recipe
 - **Search:** Ctrl+F opens a search bar; Enter matches by product/material name and cycles through results
@@ -168,7 +180,8 @@ Enumerates `ICraftingProvider` directly from `grid.getNodes()` (node service or 
 | Left-click right-side input port | Jump to that material's producer recipe |
 | Hover port | Highlight all same-material ports + linked edges |
 | Ctrl+F | Open search bar (Enter to cycle matches, Esc to close) |
-| Buttons (top-right, vertical) | Rebuild layout / Toggle module display / Export SVG / Export JSON |
+| Functions button (top-right) | Opens popup menu: Rebuild Layout / Toggle Modules / Layout Mode / Export SVG / Export JSON |
+| Layout Mode item | Cycles through available layout strategies (currently "Recipe-Material" only) |
 
 ## Status Display
 
@@ -206,6 +219,17 @@ Server logs a `[GraphTerminal]` diagnostic line with node/grid/booted/active/cha
 | NeoForge | 21.1.x |
 | Applied Energistics 2 | 19.x |
 | Java | 21 |
+
+## 配置
+
+模组提供两个通用端配置值，写入 `<config>/recipegraph.toml`，可通过 NeoForge 模组列表 → 配置按钮在游戏内修改：
+
+| 键名 | 类型 | 范围 | 默认值 | 说明 |
+|---|---|---|---|---|
+| `maxModuleSize` | int | 3–100 | 42 | 单个合并超级组件（SCC缩点）允许的最大模块数。更大的值将更多环打包进一个方框；更小的值保持 SCC 紧凑，但可能使巨型 SCC 无法合并。 |
+| `aabbIterations` | int | 50–200 | 50 | 布局后 AABB 碰撞分离迭代次数。更多迭代使卡片分离更干净，但大图上耗时增加。 |
+
+读取时自动钳制到声明范围，手动编辑 TOML 越界是安全的。修改在下次布局时生效（重建按钮或重新打开终端）。
 
 ## 工作原理
 
@@ -323,6 +347,7 @@ Server logs a `[GraphTerminal]` diagnostic line with node/grid/booted/active/cha
 - **流体/气体图标：** `AEKeyRendering.drawInGui()`——AE2 注册的渲染处理器（各附属模组提供自己的）
 - **名称：** `key.getDisplayName()` 获取本地化物料名
 - **连线：** 正交折线，亮青色（模块内）或深灰色（跨模块），线段末端有箭头
+- **Z-order：** 跨模块连线**先绘制**（底层），模块内连线**后绘制**在顶层，确保模块内连线永远不被模块外连线遮挡
 - **悬停：** 悬停端口时高亮所有同名端口 + 关联边为亮琥珀色，其余变暗
 - **点击：** 左键点击边 -> 相机跳转到下游节点；左键点击右侧输入端口 -> 跳转到该物料的产出配方
 - **搜索：** Ctrl+F 打开搜索栏；回车按产品/物料名匹配并循环跳转
@@ -358,7 +383,8 @@ Server logs a `[GraphTerminal]` diagnostic line with node/grid/booted/active/cha
 | 左键点击右侧输入端口 | 跳转至该物料的产出配方 |
 | 悬停端口 | 高亮所有同物料端口 + 关联边 |
 | Ctrl+F | 打开搜索栏（回车循环匹配，Esc 关闭） |
-| 按钮（右上角纵向） | 重建布局 / 切换模块显示 / 导出SVG / 导出数据 |
+| 功能按钮（右上角） | 弹出菜单：重建布局 / 切换模块显示 / 布局模式 / 导出SVG / 导出数据 |
+| 布局模式项 | 切换可用布局策略（当前仅"配方-材料"一种） |
 
 ## 状态显示
 
