@@ -1,0 +1,26 @@
+{
+    "type": "minecraft:crafting_shaped",
+    "pattern": [
+        "GGG",
+        "CRC",
+        "III"
+    ],
+    "key": {
+        "G": {
+            "item": "minecraft:glass"
+        },
+        "C": {
+            "item": "minecraft:copper_ingot"
+        },
+        "R": {
+            "item": "minecraft:redstone"
+        },
+        "I": {
+            "item": "minecraft:iron_ingot"
+        }
+    },
+    "result": {
+        "id": "recipegraph:graph_terminal",
+        "count": 1
+    }
+}

@@ -1,0 +1,14 @@
+# gradlew shell脚本强制LF换行
+gradlew text eol=lf
+*.sh text eol=lf
+
+# java、gradle、toml、json源码
+*.java text eol=lf
+*.gradle text eol=lf
+*.properties text eol=lf
+*.toml text eol=lf
+*.json text eol=lf
+
+# 二进制资源，不处理换行
+*.png binary
+*.jar binary

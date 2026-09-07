@@ -1,0 +1,117 @@
+plugins {
+    id 'net.neoforged.moddev' version '1.0.21'
+}
+
+version = mod_version
+group = mod_group_id
+
+base {
+    archivesName = mod_id
+}
+
+// Toolchain: pin to Java 21 (NeoForge 21.1.x requires it).
+java {
+    toolchain.languageVersion = JavaLanguageVersion.of(21)
+}
+
+tasks.withType(JavaCompile).configureEach {
+    sourceCompatibility = 21
+    targetCompatibility = 21
+    options.encoding = 'UTF-8'
+    options.compilerArgs += ['-Xlint:-options']
+}
+
+neoForge {
+    version = neo_version
+
+    runs {
+        client {
+            client()
+            programArguments.addAll('--username', 'Dev', '--uuid', '00000000-0000-0000-0000-000000000000')
+        }
+        server {
+            server()
+        }
+        data {
+            data()
+            programArguments.addAll('--all', '--output', file('src/generated/resources').absolutePath,
+                '--existing', file('src/main/resources').absolutePath)
+        }
+    }
+}
+
+// Include generated resources (for data generation runs) on the runtime classpath
+sourceSets {
+    main {
+        resources {
+            srcDirs += ['src/generated/resources']
+        }
+    }
+}
+
+repositories {
+    mavenLocal()
+    // Aliyun public mirror (helps in CN networks where maven.neoforged.net may time out)
+    maven {
+        name = 'AliyunPublic'
+        url = 'https://maven.aliyun.com/repository/public'
+    }
+    maven {
+        name = 'AliyunGradle'
+        url = 'https://maven.aliyun.com/repository/gradle-plugin'
+    }
+    // NeoForged official maven (mandatory for the moddev plugin to fetch NeoForge artifacts)
+    maven {
+        name = 'NeoForged'
+        url = 'https://maven.neoforged.net/releases'
+    }
+    // Applied Energistics 2 official maven (may be unreachable from CN networks; see below)
+    maven {
+        name = 'AEMaven'
+        url = 'https://maven.appliedenergistics.org/releases'
+        content {
+            includeGroup "appeng"
+        }
+    }
+    // Modrinth maven (used here to pull AE2 since the official AE2 maven is unreachable)
+    maven {
+        name = 'Modrinth'
+        url = 'https://api.modrinth.com/maven'
+        content {
+            includeGroup "maven.modrinth"
+        }
+    }
+    // Fallback to CurseMaven for AE2 if Modrinth fails to resolve a version
+    maven {
+        name = 'CurseMaven'
+        url = 'https://cursemaven.com'
+        content {
+            includeGroup "curse.maven"
+        }
+    }
+}
+
+dependencies {
+    // Applied Energistics 2 via Modrinth maven.
+    // Project slug: "ae2" (project id XxWD5pD3). Versions 19.2.x target MC 1.21.1 + NeoForge.
+    implementation("maven.modrinth:ae2:${ae2_version}")
+}
+
+tasks.named('processResources', ProcessResources).configure {
+    var replaceProperties = [
+        minecraft_version   : minecraft_version,
+        minecraft_version_range: minecraft_version_range,
+        neo_version_range    : neo_version_range,
+        loader_version_range: loader_version_range,
+        mod_id               : mod_id,
+        mod_name             : mod_name,
+        mod_license         : mod_license,
+        mod_version          : mod_version,
+        mod_authors         : mod_authors,
+        mod_description     : mod_description
+    ]
+    inputs.properties replaceProperties
+    filesMatching(['META-INF/neoforge.mods.toml']) {
+        expand replaceProperties + [project: project]
+    }
+}

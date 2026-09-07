@@ -1,0 +1,7 @@
+{
+    "variants": {
+        "": {
+            "model": "recipegraph:block/graph_terminal"
+        }
+    }
+}
