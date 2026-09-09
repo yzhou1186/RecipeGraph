@@ -1,12 +1,14 @@
 package com.zt.recipegraph.layout;
 
 import com.zt.recipegraph.RecipeGraphConfig;
+import com.zt.recipegraph.RecipeGraphMod;
 import com.zt.recipegraph.graph.GraphEdge;
 import com.zt.recipegraph.graph.GraphNode;
 import com.zt.recipegraph.graph.PatternGraph;
 
 import java.util.ArrayList;
 import java.util.ArrayDeque;
+import java.util.Comparator;
 import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -22,31 +24,40 @@ import java.util.Set;
  * <p>Step 1 - business modules: Louvain cluster ids (computed server side) define the
  * business boxes.</p>
  *
- * <p>Step 2 - SCC condensation with an ADAPTIVE merge cap: Tarjan SCCs are computed over
- * the directed module graph. Small graphs are condensed fully (every SCC merged, meta
- * graph a guaranteed DAG, no cycle ever leaves a box); on large graphs the cap grows with
- * sqrt(scale) — small/medium SCCs merge into super modules, but an SCC that would produce
- * an unreadably huge box stays as separate modules and its cross-module back edges route
- * via bottom rails. Node-level cycles inside a merged SCC are enclosed in one box. Small
- * networks produce few meta nodes and short chains; large networks (500+ recipes) with
- * long dependency chains automatically produce more/larger super modules and more layers.</p>
+ * <p>Step 2 - module identity = Louvain communities, NEVER glued together: boxes are
+ * exactly the Louvain clusters (plus singletons for unclustered nodes). Modules mutually
+ * reachable in a directed SCC are NOT merged — in dense modpacks even a small ring SCC
+ * ties together modules from completely different product lines via byproduct loops, so
+ * SCC merging produced boxes full of unrelated items (storage cells + QIO + 充能棒 + 天枢
+ * in one box). Rings are handled without merging: the product-anchored layering flags
+ * loop-return edges and routes them via bottom rails. The "small ring stays in one box"
+ * rule survives at the NODE level — splitOversizeBoxes() emits node-level SCCs (rings
+ * WITHIN one community) atomically. Oversize boxes (large Louvain communities) are split
+ * into consecutive chunks of at most RecipeGraphConfig.maxModuleSize() recipes — the
+ * same number the UI shows in a box title.</p>
  *
- * <p>Step 3 - dynamic longest-path layering: the meta DAG layers come from the longest
- * path (Kahn propagation): layer 0 = raw materials (no incoming flow), layer(v) =
- * max(layer(u)) + 1 over all u→v. The layer count is entirely data-driven — nothing is
- * hard-coded; the flow goes right → left (material boxes on the RIGHT, product boxes on
- * the LEFT). Y ordering comes from barycenter sweeps with per-layer overlap resolution.</p>
+ * <p>Step 3 - product-anchored layering: dense modpacks tie almost every module into one
+ * giant SCC through byproduct loops, so module out-degree is never 0. Layer 0 anchors are
+ * the PRODUCT side: modules containing a final-product recipe (a recipe node with no
+ * outgoing edge) and genuine out-degree-0 sinks outside rings. Ring-exit nodes are NOT
+ * anchored (splitting turns intra-box edges into inter-box edges, which made artificial
+ * exits explode into dozens of false anchors). A reverse (consumer → producer) DFS rooted
+ * at those anchors flags loop-return edges; longest-path relaxation over the remaining
+ * edges places every box — final products FAR LEFT, raw-material sources RIGHT — with
+ * unreachable recycler modules placed beyond all product chains. The layer count is
+ * entirely data-driven. Y ordering comes from barycenter sweeps with per-layer overlap
+ * resolution.</p>
  *
- * <p>Step 4 - module internals: each box (including super modules) gets an INDEPENDENT
- * local layout — its own longest-path column ranks, never inheriting the external meta
- * layer. Inputs enter on the right edge, outputs leave on the left edge; internal cycle
- * edges (byproduct loops) route along the box's own top/bottom border and never leave it.</p>
+ * <p>Step 4 - module internals: each box gets an INDEPENDENT local layout — its own
+ * longest-path column ranks, never inheriting the external meta layer. Inputs enter on
+ * the right edge, outputs leave on the left edge; internal cycle edges (byproduct loops)
+ * route along the box's own top/bottom border and never leave it.</p>
  *
- * <p>Step 5 - global edge routing: cross-module edges run as horizontal/vertical polylines
- * through the vertical channel right of the target module (upstream module's LEFT output
- * port → downstream module's RIGHT input port), each edge on its own track to avoid
- * overlaps. (The bottom-rail back-edge path remains only as a defensive fallback; a fully
- * condensed DAG never produces back edges.)</p>
+ * <p>Step 5 - global edge routing: forward cross-module edges run as horizontal/vertical
+ * polylines through the vertical channel between the two boxes (producer's LEFT output
+ * port → consumer's RIGHT input port; producer sits RIGHT of consumer in the
+ * product-anchored layout), each edge on its own track to avoid overlaps. Loop-return /
+ * byproduct edges (railPairs) route along the bottom rail below all boxes.</p>
  */
 public final class HierarchicalLayout {
 
@@ -73,6 +84,10 @@ public final class HierarchicalLayout {
     private final PatternGraph graph;
     private final LayoutResult result = new LayoutResult();
 
+    /** Cross-module edge pairs ("producerModule|consumerModule") routed as bottom rails:
+     *  feedback/loop-return edges and anything the layering proves non-forward. */
+    private final Set<String> railPairs = new HashSet<>();
+
     public HierarchicalLayout(PatternGraph graph) {
         this.graph = graph;
     }
@@ -93,49 +108,36 @@ public final class HierarchicalLayout {
             b.nodes.add(n);
         }
 
-        // ===== 2. SCC condensation of the directed module graph (ADAPTIVE cap) =====
-        // Small graphs (<=8 modules / <=60 nodes): every SCC merges fully -> the meta
-        // graph is a guaranteed DAG and no cycle ever leaves a box. Large graphs: the cap
-        // scales with sqrt(scale) so small/medium SCCs still merge, but a mega SCC that
-        // would produce an unreadably huge super module stays apart — its back edges are
-        // detected (findBackEdges) and routed via bottom rails.
-        Map<Integer, List<Integer>> metaAdj = buildMetaAdjacency();
-        List<List<Integer>> sccs = tarjanSCC(metaAdj);
-        int totalModules = boxes.size();
-        long totalNodes = graph.getNodeCount();
-        // moduleCap: scaled adaptive value, but capped by user config maxModuleSize
-        int dynamicModuleCap = totalModules <= 8
-            ? totalModules
-            : Math.max(4, (int) Math.round(Math.sqrt(totalModules) * 1.6));
-        int moduleCap = Math.min(dynamicModuleCap, RecipeGraphConfig.maxModuleSize());
-        long nodeCap = totalNodes <= 60
-            ? totalNodes
-            : Math.max(60, Math.round(Math.sqrt(totalNodes) * 9.0));
-        for (List<Integer> scc : sccs) {
-            if (scc.size() < 2) continue;
-            long mergedNodes = 0;
-            for (int id : scc) {
-                ModuleBox b0 = boxes.get(id);
-                if (b0 != null) mergedNodes += b0.nodes.size();
-            }
-            if (scc.size() > moduleCap || mergedNodes > nodeCap) continue; // leave big SCCs apart
-            int target = scc.stream().min(Integer::compare).orElse(scc.get(0));
-            ModuleBox tb = boxes.get(target);
-            for (int id : scc) {
-                if (id == target) continue;
-                ModuleBox b = boxes.get(id);
-                tb.nodes.addAll(b.nodes);
-                for (GraphNode n : b.nodes) n.setCluster(target);
-                boxes.remove(id);
-            }
-            // nodes may appear twice if Louvain ids overlapped - dedupe
-            LinkedHashSet<GraphNode> dedup = new LinkedHashSet<>(tb.nodes);
-            tb.nodes.clear();
-            tb.nodes.addAll(dedup);
-        }
+        // ===== 2. module identity = Louvain communities (NEVER glued together) =====
+        // Module boxes are exactly the Louvain clusters (plus singletons for unclustered
+        // nodes). Louvain already decides which recipes belong together by edge density;
+        // merging modules that happen to be mutually reachable (a directed SCC) overrides
+        // that decision and mixes unrelated tech lines — in dense modpacks even a SMALL
+        // ring SCC ties together modules from completely different product lines via
+        // byproduct loops, so an SCC merge produced boxes full of unrelated items
+        // (e.g. storage cells + QIO + 充能棒 + 天枢 in one box). Rings are handled WITHOUT
+        // merging: the anchor-rooted layering in sugiyama() flags loop-return edges and
+        // routes them via bottom rails. The "小环固定" rule survives at the NODE level —
+        // splitOversizeBoxes() emits node-level SCCs (rings WITHIN one community)
+        // atomically so a small internal ring is never cut across chunk boundaries.
+        int cap = RecipeGraphConfig.maxModuleSize();
 
-        // ===== 3. size every module from its internal columnar layout =====
+        // ===== 3. internal column plan for every box (also feeds the oversize splitter) =====
         Map<Integer, InternalPlan> plans = new HashMap<>();
+        for (ModuleBox b : boxes.values()) plans.put(b.id, planInternal(b));
+
+        // ===== 3.5 split oversize boxes into chunks of at most `cap` recipes =====
+        // Naturally-occurring large Louvain communities are split here so every box
+        // stays within the recipe-count cap. Node-level SCCs (rings WITHIN one
+        // community) smaller than the cap stay atomic — a small internal ring is
+        // never cut across chunk boundaries.
+        splitOversizeBoxes(boxes, plans, cap);
+
+        // ===== 3.6 renumber boxes to 0..N-1 (split leaves negative ids) =====
+        renumberBoxes(boxes);
+
+        // ===== 3.7 final internal plan + box size (plans are keyed by the new ids) =====
+        plans.clear();
         for (ModuleBox b : boxes.values()) {
             InternalPlan p = planInternal(b);
             plans.put(b.id, p);
@@ -146,14 +148,12 @@ public final class HierarchicalLayout {
             b.minY = 0;
         }
 
-        // ===== 4. rebuild the meta digraph on the condensed modules (it is a DAG now) =====
-        // findBackEdges is kept as defensive machinery: with full SCC condensation no
-        // module-level cycle remains, so the returned set is empty and no rails are used.
-        metaAdj = buildMetaAdjacency();
-        Set<String> metaBack = findBackEdges(metaAdj);
+        // ===== 4. rebuild the meta digraph on the final modules =====
+        Map<Integer, List<Integer>> metaAdj = buildMetaAdjacency();
 
-        // ===== 5. Sugiyama on the meta-graph =====
-        sugiyama(metaAdj, metaBack);
+        // ===== 5. Sugiyama on the meta-graph (layering also computes railPairs:
+        //         feedback/loop-return edges routed via bottom rails) =====
+        sugiyama(metaAdj);
 
         // ===== 6. place nodes inside their module rectangles =====
         for (ModuleBox b : boxes.values()) {
@@ -162,11 +162,15 @@ public final class HierarchicalLayout {
 
         // ===== 6.5 post-layout AABB collision separation =====
         // Runs after intra-box placement but before edge routing so edge anchors
-        // use the separated positions. Controlled by RecipeGraphConfig.aabbIterations().
-        separateNodes(graph.getNodes(), RecipeGraphConfig.aabbIterations());
+        // use the separated positions. Iteration count adapts to graph size: small
+        // graphs converge in a few passes, large graphs get more (capped so a huge
+        // network never stalls the layout thread).
+        int nodeCount = graph.getNodes().size();
+        int aabbIterations = Math.max(40, Math.min(200, 40 + nodeCount / 10));
+        separateNodes(graph.getNodes(), aabbIterations);
 
-        // ===== 7. route every pattern edges =====
-        routeEdges(metaBack);
+        // ===== 7. route every pattern edge (railPairs from layering → bottom rails) =====
+        routeEdges();
 
         // world bounds normalisation: shift everything into positive space with margin
         normalise();
@@ -190,6 +194,103 @@ public final class HierarchicalLayout {
             if (l != null && !l.contains(c)) l.add(c);
         }
         return adj;
+    }
+
+    /**
+     * Splits every box holding more than {@code cap} recipes into consecutive chunks of at
+     * most {@code cap} recipes, following the box's internal (column, row) flow order. The
+     * emission units are node-level SCCs on the box's internal edges: a unit smaller than
+     * the cap is emitted atomically (a small internal ring is never cut in half); bigger
+     * units are cut like ordinary nodes. Chunk boxes get fresh (negative) ids which the
+     * following renumber step makes contiguous again.
+     */
+    private void splitOversizeBoxes(Map<Integer, ModuleBox> boxes, Map<Integer, InternalPlan> plans, int cap) {
+        List<ModuleBox> oversize = new ArrayList<>();
+        for (ModuleBox b : boxes.values()) {
+            if (b.nodes.size() > cap) oversize.add(b);
+        }
+        if (oversize.isEmpty()) return;
+
+        int freshId = -1_000_000;
+        for (ModuleBox b : oversize) {
+            InternalPlan plan = plans.get(b.id);
+            List<List<GraphNode>> units = emissionUnits(b, plan, cap);
+            // deterministic (col, row) flow order by the unit's first node
+            units.sort((u, v) -> {
+                GraphNode a = u.get(0);
+                GraphNode c = v.get(0);
+                int cmp = Integer.compare(plan.col(a.getId()), plan.col(c.getId()));
+                return cmp != 0 ? cmp : Integer.compare(plan.row(a.getId()), plan.row(c.getId()));
+            });
+
+            // greedy pack units into chunks of at most cap recipes
+            List<List<GraphNode>> chunks = new ArrayList<>();
+            List<GraphNode> cur = new ArrayList<>();
+            for (List<GraphNode> unit : units) {
+                if (!cur.isEmpty() && cur.size() + unit.size() > cap) {
+                    chunks.add(cur);
+                    cur = new ArrayList<>();
+                }
+                cur.addAll(unit);
+            }
+            if (!cur.isEmpty()) chunks.add(cur);
+
+            boxes.remove(b.id);
+            for (List<GraphNode> chunk : chunks) {
+                ModuleBox nb = new ModuleBox(freshId--);
+                nb.nodes.addAll(chunk);
+                for (GraphNode n : chunk) n.setCluster(nb.id);
+                boxes.put(nb.id, nb);
+            }
+        }
+    }
+
+    /**
+     * Emission units of one box: node-level Tarjan SCCs over the box's internal edges.
+     * Components smaller than {@code cap} stay atomic; components of {@code cap} or more
+     * explode into individual nodes so they can be cut by the packer.
+     */
+    private List<List<GraphNode>> emissionUnits(ModuleBox box, InternalPlan plan, int cap) {
+        List<GraphNode> members = box.nodes;
+        Map<String, Integer> idx = new HashMap<>();
+        for (int i = 0; i < members.size(); i++) idx.put(members.get(i).getId(), i);
+
+        Map<Integer, List<Integer>> adj = new LinkedHashMap<>();
+        for (int i = 0; i < members.size(); i++) adj.put(i, new ArrayList<>());
+        for (GraphEdge e : graph.getEdges()) {
+            if (e.getFrom().getCluster() != box.id || e.getTo().getCluster() != box.id) continue;
+            Integer a = idx.get(e.getFrom().getId());
+            Integer c = idx.get(e.getTo().getId());
+            if (a == null || c == null || a.intValue() == c.intValue()) continue;
+            adj.get(a).add(c);
+        }
+
+        List<List<GraphNode>> units = new ArrayList<>();
+        for (List<Integer> scc : tarjanSCC(adj)) {
+            if (scc.size() < cap) {
+                List<GraphNode> unit = new ArrayList<>(scc.size());
+                for (int i : scc) unit.add(members.get(i));
+                units.add(unit);
+            } else {
+                for (int i : scc) units.add(List.of(members.get(i)));
+            }
+        }
+        return units;
+    }
+
+    /** Renumbers boxes to contiguous ids 0..N-1 (stable order by old id) and rewrites clusters. */
+    private static void renumberBoxes(Map<Integer, ModuleBox> boxes) {
+        List<ModuleBox> ordered = new ArrayList<>(boxes.values());
+        ordered.sort(Comparator.comparingInt(b -> b.id));
+        boxes.clear();
+        int next = 0;
+        for (ModuleBox b : ordered) {
+            ModuleBox nb = new ModuleBox(next);
+            nb.nodes.addAll(b.nodes);
+            for (GraphNode n : nb.nodes) n.setCluster(next);
+            boxes.put(next, nb);
+            next++;
+        }
     }
 
     /** Iterative Tarjan SCC. Returns list of components (each a list of module ids). */
@@ -250,40 +351,6 @@ public final class HierarchicalLayout {
             }
         }
         return out;
-    }
-
-    /** DFS cycle removal: returns the set of "from|to" meta edges flagged as back edges. */
-    private static Set<String> findBackEdges(Map<Integer, List<Integer>> adj) {
-        Set<String> back = new HashSet<>();
-        Map<Integer, Integer> color = new HashMap<>(); // 0 white 1 gray 2 black
-        for (Integer root : adj.keySet()) {
-            if (color.getOrDefault(root, 0) != 0) continue;
-            Deque<Integer> nodes = new ArrayDeque<>();
-            Deque<java.util.Iterator<Integer>> iters = new ArrayDeque<>();
-            nodes.push(root);
-            iters.push(adj.get(root).iterator());
-            color.put(root, 1);
-            while (!nodes.isEmpty()) {
-                int v = nodes.peek();
-                java.util.Iterator<Integer> it = iters.peek();
-                if (it.hasNext()) {
-                    int w = it.next();
-                    int cw = color.getOrDefault(w, 0);
-                    if (cw == 0) {
-                        color.put(w, 1);
-                        nodes.push(w);
-                        iters.push(adj.get(w).iterator());
-                    } else if (cw == 1) {
-                        back.add(v + "|" + w);
-                    }
-                } else {
-                    color.put(v, 2);
-                    nodes.pop();
-                    iters.pop();
-                }
-            }
-        }
-        return back;
     }
 
     // ===================================================================
@@ -460,8 +527,9 @@ public final class HierarchicalLayout {
     // Step 5: meta Sugiyama (layering + barycenter y placement)
     // ===================================================================
 
-    private void sugiyama(Map<Integer, List<Integer>> metaAdj, Set<String> metaBack) {
+    private void sugiyama(Map<Integer, List<Integer>> metaAdj) {
         Map<Integer, ModuleBox> boxes = result.boxes;
+        railPairs.clear();
         if (boxes.size() == 1) {
             ModuleBox only = boxes.values().iterator().next();
             only.minX = MARGIN;
@@ -471,38 +539,194 @@ public final class HierarchicalLayout {
             return;
         }
 
-        // --- layer assignment: longest path over the DAG (ignore back edges) ---
+        // === layer assignment: PRODUCT-SIDE anchors at layer 0 (far LEFT) ===
+        // Dense modpacks tie almost every module into one giant SCC via byproduct loops,
+        // so module out-degree is never 0; seeding reverse Kahn on DFS-back-stripped
+        // sinks lands on arbitrary ring-tail points and piles them all onto the left
+        // column. Instead layer 0 anchors on the genuine product side:
+        //   (a) a module that contains a FINAL-PRODUCT recipe (a recipe NODE with no
+        //       outgoing edge — the user's literal 出度为0 配方);
+        //   (c) a genuine sink outside rings (out-degree 0 and not in a multi-module SCC).
+        // Ring EXIT nodes (a ring member feeding something outside its SCC) are NOT
+        // anchored: the anchor-rooted reverse DFS reaches them at layer >= 1, which is
+        // exactly right — they sit one column to the RIGHT of the products they feed.
+        // Anchoring every ring exit was wrong in two ways: (1) it put dozens of ring
+        // nodes on the far-left column, and (2) oversize SPLITTING turns formerly
+        // intra-box edges into inter-box edges, which multiplies artificial "exits"
+        // (observed: 45 false anchors / 48 boxes in column 0 after a split, vs 6 real
+        // final-product modules). Feedback edges are found by a DFS rooted at the
+        // anchors, walking REVERSE edges (consumer → producer): an edge back into a
+        // grey ancestor is a loop return. Rooting the DFS at products (rather than an
+        // arbitrary global DFS) makes the resulting DAG span the whole SCC from the
+        // product side.
         Map<Integer, Integer> layer = new HashMap<>();
-        Map<Integer, Integer> inDeg = new HashMap<>();
-        for (Integer id : boxes.keySet()) inDeg.put(id, 0);
+        Set<Integer> anchors = new HashSet<>();
+
+        // (a) final-product recipes
+        Set<String> producerIds = new HashSet<>();
+        for (GraphEdge e : graph.getEdges()) producerIds.add(e.getFrom().getId());
+        for (GraphNode n : graph.getNodes()) {
+            if (!producerIds.contains(n.getId()) && boxes.containsKey(n.getCluster())) {
+                anchors.add(n.getCluster());
+            }
+        }
+
+        // SCC membership (for the genuine-sink rule; ring-exit nodes are intentionally
+        // NOT anchored — see comment above)
+        List<List<Integer>> sccs = tarjanSCC(metaAdj);
+        Set<Integer> multi = new HashSet<>();
+        for (List<Integer> comp : sccs) {
+            if (comp.size() > 1) multi.addAll(comp);
+        }
+
+        // reverse adjacency: consumer module -> producer modules (sorted for a stable DFS)
+        Map<Integer, List<Integer>> rev = new LinkedHashMap<>();
+        for (Integer id : boxes.keySet()) rev.put(id, new ArrayList<>());
         for (Map.Entry<Integer, List<Integer>> en : metaAdj.entrySet()) {
-            for (Integer to : en.getValue()) {
-                if (!metaBack.contains(en.getKey() + "|" + to)) {
-                    inDeg.merge(to, 1, Integer::sum);
+            int u = en.getKey();
+            for (int v : en.getValue()) {
+                rev.computeIfAbsent(v, k -> new ArrayList<>()).add(u);
+            }
+        }
+        rev.values().forEach(l -> l.sort(Integer::compare));
+
+        // (c) genuine sinks outside rings
+        Set<Integer> rootSet = new LinkedHashSet<>(anchors);
+        for (Integer id : boxes.keySet()) {
+            if (metaAdj.getOrDefault(id, List.of()).isEmpty() && !multi.contains(id)) {
+                rootSet.add(id);
+            }
+        }
+        List<Integer> roots = new ArrayList<>(rootSet);
+        roots.sort(Integer::compare);
+
+        // anchor-rooted DFS over reverse edges -> feedback (loop-return) pairs "u|v"
+        Set<String> feedback = new HashSet<>();
+        Map<Integer, Integer> color = new HashMap<>(); // 0 white, 1 grey, 2 black
+        for (int root : roots) {
+            if (color.getOrDefault(root, 0) != 0) continue;
+            Deque<Integer> dn = new ArrayDeque<>();
+            Deque<java.util.Iterator<Integer>> di = new ArrayDeque<>();
+            color.put(root, 1);
+            dn.push(root);
+            di.push(rev.getOrDefault(root, List.of()).iterator());
+            while (!dn.isEmpty()) {
+                int v = dn.peek();
+                java.util.Iterator<Integer> it = di.peek();
+                boolean advanced = false;
+                while (it.hasNext()) {
+                    int u = it.next(); // u produces for v
+                    int cu = color.getOrDefault(u, 0);
+                    if (cu == 0) {
+                        color.put(u, 1);
+                        dn.push(u);
+                        di.push(rev.getOrDefault(u, List.of()).iterator());
+                        advanced = true;
+                        break;
+                    } else if (cu == 1) {
+                        feedback.add(u + "|" + v); // forward edge u->v loops back
+                    }
+                }
+                if (advanced) continue;
+                color.put(v, 2);
+                dn.pop();
+                di.pop();
+            }
+        }
+
+        // pass 1: longest-path relaxation from the roots over non-feedback reverse edges.
+        // Anchors stay frozen at layer 0. The non-feedback graph is a DAG (feedback
+        // removed exactly the DFS back edges), so the queue relaxation terminates.
+        Deque<Integer> q = new ArrayDeque<>();
+        Set<Integer> inQ = new HashSet<>();
+        for (int r : roots) {
+            layer.put(r, 0);
+            q.add(r);
+            inQ.add(r);
+        }
+        while (!q.isEmpty()) {
+            int v = q.poll();
+            inQ.remove(v);
+            for (int u : rev.getOrDefault(v, List.of())) {
+                if (feedback.contains(u + "|" + v)) continue;
+                if (anchors.contains(u)) continue; // anchors never leave layer 0
+                int cand = layer.get(v) + 1;
+                if (cand > layer.getOrDefault(u, -1)) {
+                    layer.put(u, cand);
+                    if (inQ.add(u)) q.add(u);
                 }
             }
         }
-        Deque<Integer> q = new ArrayDeque<>();
-        for (Map.Entry<Integer, Integer> en : inDeg.entrySet()) {
-            if (en.getValue() == 0) {
-                layer.put(en.getKey(), 0);
-                q.add(en.getKey());
-            }
-        }
-        while (!q.isEmpty()) {
-            int u = q.poll();
-            for (Integer v : metaAdj.getOrDefault(u, List.of())) {
-                if (metaBack.contains(u + "|" + v)) continue;
-                layer.put(v, Math.max(layer.getOrDefault(v, 0), layer.get(u) + 1));
-                inDeg.merge(v, -1, Integer::sum);
-                if (inDeg.get(v) == 0) q.add(v);
-            }
-        }
-        // defensive: in a fully condensed DAG every module is reached from a layer-0 source
-        // (following predecessors must terminate at an in-degree-zero raw-material module),
-        // so this fallback never fires — it only guards against pathological data.
-        for (Integer id : boxes.keySet()) layer.putIfAbsent(id, 0);
         int maxLayer = layer.values().stream().max(Integer::compare).orElse(0);
+
+        // pass 2: modules unreachable from the product side (pure byproduct recyclers)
+        // get penalty layers beyond every product chain. BFS shortest hops from the
+        // boundary — first assignment wins, so product-path modules are never pushed right.
+        List<Integer> unreached = new ArrayList<>();
+        for (Integer id : boxes.keySet()) {
+            if (!layer.containsKey(id)) unreached.add(id);
+        }
+        if (!unreached.isEmpty()) {
+            int pen = maxLayer + 1;
+            Set<Integer> uset = new HashSet<>(unreached);
+            Deque<int[]> q2 = new ArrayDeque<>(); // {module, hopsFromBoundary}
+            for (Map.Entry<Integer, List<Integer>> en : metaAdj.entrySet()) {
+                int u = en.getKey();
+                if (!uset.contains(u)) continue;
+                for (int v : en.getValue()) {
+                    if (!feedback.contains(u + "|" + v) && !uset.contains(v)) {
+                        layer.put(u, pen);
+                        q2.add(new int[]{u, 0});
+                        break;
+                    }
+                }
+            }
+            while (!q2.isEmpty()) {
+                int[] cur = q2.poll();
+                int v = cur[0], d = cur[1];
+                for (int u : rev.getOrDefault(v, List.of())) {
+                    if (feedback.contains(u + "|" + v)) continue;
+                    if (uset.contains(u) && !layer.containsKey(u)) {
+                        layer.put(u, pen + d + 1);
+                        q2.add(new int[]{u, d + 1});
+                    }
+                }
+            }
+            for (int u : unreached) layer.putIfAbsent(u, pen);
+            maxLayer = layer.values().stream().max(Integer::compare).orElse(0);
+        }
+
+        // rail pairs: feedback edges plus anything the layering proves non-forward
+        // (same-column or backward pairs = loop returns routed via bottom rails).
+        railPairs.addAll(feedback);
+        int railCount = feedback.size();
+        for (Map.Entry<Integer, List<Integer>> en : metaAdj.entrySet()) {
+            Integer lu = layer.get(en.getKey());
+            for (int v : en.getValue()) {
+                Integer lv = layer.get(v);
+                if (lu == null || lv == null || lu <= lv) {
+                    if (railPairs.add(en.getKey() + "|" + v)) railCount++;
+                }
+            }
+        }
+
+        // diagnostics: every layer-0 box must be a product anchor (leftButNotAnchor=[])
+        int nodeSinkRecipes = (int) graph.getNodes().stream()
+                .filter(n -> !producerIds.contains(n.getId())).count();
+        List<Integer> layer0 = new ArrayList<>();
+        List<Integer> leftButNotAnchor = new ArrayList<>();
+        for (Integer id : boxes.keySet()) {
+            if (layer.get(id) == 0) {
+                layer0.add(id);
+                if (!rootSet.contains(id)) leftButNotAnchor.add(id);
+            }
+        }
+        RecipeGraphMod.LOGGER.info(
+            "[RecipeGraph] layering: boxes={} columns={} sccs>1={} (sizes {}) nodeSinkRecipes={} rails={} layer0Boxes={} | leftButNotAnchor={}",
+            boxes.size(), maxLayer + 1,
+            sccs.stream().filter(c -> c.size() > 1).count(),
+            sccs.stream().filter(c -> c.size() > 1).map(c -> String.valueOf(c.size())).toList(),
+            nodeSinkRecipes, railCount, layer0.size(), leftButNotAnchor);
 
         // --- layered structure with dummy nodes for edges spanning >1 layer ---
         List<List<Item>> layers = new ArrayList<>();
@@ -517,15 +741,15 @@ public final class HierarchicalLayout {
         Map<Item, List<Item>> neigh = new HashMap<>();
         for (Map.Entry<Integer, List<Integer>> en : metaAdj.entrySet()) {
             Item from = modItems.get(en.getKey());
+            int lf = layer.get(en.getKey());
             for (Integer toId : en.getValue()) {
-                boolean back = metaBack.contains(en.getKey() + "|" + toId);
-                if (back) continue; // back edges are rails, not part of layer flow
+                if (railPairs.contains(en.getKey() + "|" + toId)) continue; // rails: no dummies, no barycentre
                 Item to = modItems.get(toId);
                 if (to == null) continue;
-                int lf = layer.get(en.getKey());
                 int lt = layer.get(toId);
+                // surviving edges are strictly forward (lf > lt): producer to the right
                 Item prev = from;
-                for (int l = lf + 1; l < lt; l++) {
+                for (int l = lt + 1; l < lf; l++) {
                     Item d = Item.dummy(dummySeq++);
                     layers.get(l).add(d);
                     neigh.computeIfAbsent(prev, k -> new ArrayList<>()).add(d);
@@ -571,32 +795,25 @@ public final class HierarchicalLayout {
             }
         }
 
-        // --- x per layer (accumulate widths leftward in flow order, then mirror) ---
-        // Flow order: layer 0 = raw materials ends up on the RIGHT.
-        double[] flowX = new double[layers.size()]; // left-edge offset in flow direction
+        // --- x per layer (direct: layer 0 = sinks on the LEFT, no mirroring) ---
+        double[] flowX = new double[layers.size()]; // left-edge offset
         for (int l = 1; l < layers.size(); l++) {
             double maxPrev = 0;
             for (Item it : layers.get(l - 1)) maxPrev = Math.max(maxPrev, it.dummy ? DUMMY_H : it.box.getWidth());
             flowX[l] = flowX[l - 1] + maxPrev + LAYER_GAP;
         }
-        double lastMax = 0;
-        for (Item it : layers.get(layers.size() - 1)) {
-            lastMax = Math.max(lastMax, it.dummy ? DUMMY_H : it.box.getWidth());
-        }
-        double totalW = flowX[layers.size() - 1] + lastMax;
 
-        // --- commit module rectangles (mirror: layer 0 on the right) ---
+        // --- commit module rectangles (direct: layer 0 on the left) ---
         for (Map.Entry<Integer, Item> en : modItems.entrySet()) {
             Item it = en.getValue();
             ModuleBox b = it.box;
             double yy = y.get(it);
             int l = layer.get(en.getKey());
-            double rightEdge = totalW - flowX[l];
             // capture size BEFORE writing: getWidth/getHeight read maxX-minX/maxY-minY
             double w = b.getWidth();
             double h = b.getHeight();
-            b.maxX = MARGIN + rightEdge;
-            b.minX = MARGIN + rightEdge - w;
+            b.minX = MARGIN + flowX[l];
+            b.maxX = b.minX + w;
             b.minY = MARGIN + yy - h / 2.0;
             b.maxY = b.minY + h;
         }
@@ -670,10 +887,10 @@ public final class HierarchicalLayout {
     }
 
     // ===================================================================
-    // Step 7: edge routing (right-to-left flow)
+    // Step 7: edge routing (producer RIGHT → consumer LEFT; loop returns via bottom rails)
     // ===================================================================
 
-    private void routeEdges(Set<String> metaBack) {
+    private void routeEdges() {
         Map<Integer, ModuleBox> boxes = result.boxes;
         int bottomTrack = 0;
         Map<Integer, Integer> perTarget = new HashMap<>();
@@ -690,17 +907,23 @@ public final class HierarchicalLayout {
             if (bu == null || bv == null) continue;
 
             // anchor points: producer's OUTPUT port (card LEFT edge) -> consumer's INPUT
-            // port (card RIGHT edge), Y aligned to the material's own port row
+            // port (card RIGHT edge), Y aligned to the material's own port row.
+            // X is offset OUTWARD past the port chip so the line never runs through the
+            // material icon/label (chips extend ~18px for the icon and ~76px for the full
+            // chip from the card edge). Intra-module card gaps are tight (COL_GAP leaves
+            // just enough room for facing labels) -> clear only the icon there; inter-box
+            // gaps are wide -> clear the whole chip (icon + label).
             String key = e.getKeyId();
-            double sx = u.portX(true);
+            double chipClear = (mu == mv) ? 20.0 : 80.0;
+            double sx = u.portX(true) - chipClear;  // output chips extend LEFT
             double sy = u.portY(true, key, PORT_ROW);
-            double ex = v.portX(false);
+            double ex = v.portX(false) + chipClear; // input chips extend RIGHT
             double ey = v.portY(false, key, PORT_ROW);
 
             double[] pts;
             if (mu == mv) {
                 if (v.x > u.x + 1) {
-                    // internal cycle (target sits to the RIGHT of source = backward in RTL flow):
+                    // internal cycle (target sits to the RIGHT of source = backward in internal RTL flow):
                     // route along the box's top/bottom border, never leaving the box
                     boolean useTop = (ei & 1) == 0;
                     double railY = useTop
@@ -724,7 +947,7 @@ public final class HierarchicalLayout {
                         ex, ey
                     };
                 }
-            } else if (metaBack.contains(mu + "|" + mv)) {
+            } else if (railPairs.contains(mu + "|" + mv)) {
                 // byproduct return flow: bottom rail around the canvas, enter target from the right
                 int track = bottomTrack++;
                 double railY = result.getMaxY() + 50 + track * 14.0;
@@ -738,8 +961,8 @@ public final class HierarchicalLayout {
                 };
                 result.backEdgeIndices.add(ei);
             } else {
-                // normal cross-module flow (right → left): channel right of the target,
-                // one track per edge to avoid overlaps
+                // normal cross-module flow (producer RIGHT → consumer LEFT):
+                // channel right of the target (between the two boxes), one track per edge
                 int k = perTarget.getOrDefault(mv, 0);
                 perTarget.put(mv, k + 1);
                 double offset = ((k + 1) / 2) * 9.0 * ((k % 2 == 0) ? -1 : 1);
@@ -794,7 +1017,12 @@ public final class HierarchicalLayout {
      * are produced by placeInternal), this mainly cleans up small floating-point overlaps and
      * any cross-module boundary nudges caused by box placement rounding.
      *
-     * <p>Configurable via {@link RecipeGraphConfig#aabbIterations()} (range 50–200, default 50).
+     * <p>The spatial hash keeps the pair tests near O(kn): cell keys encode (cx, cy) reversibly
+     * as {@code (cx << 32) | (cy & 0xFFFFFFFF)} and only the cell itself plus its four forward
+     * neighbours are scanned, so every unordered cell pair is visited exactly once.
+     *
+     * <p>Iteration count adapts to graph size: {@code clamp(40 + n/10, 40, 200)} passes where
+     * n is the recipe count — small graphs converge quickly, large graphs get more passes.
      */
     private static void separateNodes(java.util.Collection<GraphNode> nodes, int iterations) {
         int n = nodes.size();
@@ -814,6 +1042,8 @@ public final class HierarchicalLayout {
         // Spatial hash grid for O(kn) instead of O(n²) per iteration
         double cellSize = Math.max(CARD_W, PORT_ROW * 4);
         java.util.HashMap<Long, List<Integer>> grid = new java.util.HashMap<>();
+        // forward half-neighbourhood: self + {(1,0),(0,1),(1,1),(1,-1)}
+        int[][] offs = {{0, 0}, {1, 0}, {0, 1}, {1, 1}, {1, -1}};
 
         for (int iter = 0; iter < iterations; iter++) {
             // Rebuild spatial hash each pass — nodes move
@@ -822,50 +1052,48 @@ public final class HierarchicalLayout {
                 GraphNode node = arr[i];
                 long cx = (long) Math.floor(node.x / cellSize);
                 long cy = (long) Math.floor(node.y / cellSize);
-                long key = cx * 73856093L ^ cy * 19349663L;
-                grid.computeIfAbsent(key, k -> new ArrayList<>()).add(i);
+                grid.computeIfAbsent((cx << 32) | (cy & 0xFFFFFFFFL), k -> new ArrayList<>()).add(i);
             }
 
-            double totalDx = 0, totalDy = 0;
+            double[] total = {0, 0};
 
             for (Map.Entry<Long, List<Integer>> en : grid.entrySet()) {
                 long key = en.getKey();
-                long cx = key / 73856093L;
-                long cy = key % 73856093L;
+                long cx = key >> 32;
+                long cy = (key << 32) >> 32; // sign-extend the low 32 bits back
 
-                // Check this cell and 8 neighbours
-                for (int dx = -1; dx <= 1; dx++) {
-                    for (int dy = -1; dy <= 1; dy++) {
-                        long nk = (cx + dx) * 73856093L ^ (cy + dy) * 19349663L;
-                        List<Integer> other = grid.get(nk);
-                        if (other == null) continue;
+                for (int[] off : offs) {
+                    boolean sameCell = off[0] == 0 && off[1] == 0;
+                    List<Integer> other = sameCell
+                        ? en.getValue()
+                        : grid.get(((cx + off[0]) << 32) | ((cy + off[1]) & 0xFFFFFFFFL));
+                    if (other == null) continue;
 
-                        List<Integer> here = en.getValue();
-                        for (int i : here) {
-                            GraphNode ni = arr[i];
-                            for (int j : other) {
-                                if (j <= i) continue; // avoid double processing
-                                GraphNode nj = arr[j];
+                    List<Integer> here = en.getValue();
+                    for (int i : here) {
+                        GraphNode ni = arr[i];
+                        for (int j : other) {
+                            if (sameCell && j <= i) continue; // same cell: each pair once
+                            GraphNode nj = arr[j];
 
-                                // AABB overlap test
-                                double ox = halfW[i] + halfW[j] - Math.abs(ni.x - nj.x);
-                                double oy = halfH[i] + halfH[j] - Math.abs(ni.y - nj.y);
-                                if (ox <= 0 || oy <= 0) continue; // no overlap
+                            // AABB overlap test
+                            double ox = halfW[i] + halfW[j] - Math.abs(ni.x - nj.x);
+                            double oy = halfH[i] + halfH[j] - Math.abs(ni.y - nj.y);
+                            if (ox <= 0 || oy <= 0) continue; // no overlap
 
-                                // Push apart along the axis of smaller overlap
-                                if (ox < oy) {
-                                    double sign = (ni.x < nj.x) ? -1 : 1;
-                                    double push = ox * 0.5;
-                                    ni.x += sign * push;
-                                    nj.x -= sign * push;
-                                    totalDx += push;
-                                } else {
-                                    double sign = (ni.y < nj.y) ? -1 : 1;
-                                    double push = oy * 0.5;
-                                    ni.y += sign * push;
-                                    nj.y -= sign * push;
-                                    totalDy += push;
-                                }
+                            // Push apart along the axis of smaller overlap
+                            if (ox < oy) {
+                                double sign = (ni.x < nj.x) ? -1 : 1;
+                                double push = ox * 0.5;
+                                ni.x += sign * push;
+                                nj.x -= sign * push;
+                                total[0] += push;
+                            } else {
+                                double sign = (ni.y < nj.y) ? -1 : 1;
+                                double push = oy * 0.5;
+                                ni.y += sign * push;
+                                nj.y -= sign * push;
+                                total[1] += push;
                             }
                         }
                     }
@@ -873,7 +1101,7 @@ public final class HierarchicalLayout {
             }
 
             // Early exit if the layout has stabilised
-            if (totalDx < 0.1 && totalDy < 0.1) break;
+            if (total[0] < 0.1 && total[1] < 0.1) break;
         }
     }
 }

@@ -81,6 +81,7 @@ public class GraphTerminalScreen extends Screen implements MenuAccess<GraphTermi
     @Override
     protected void init() {
         super.init();
+        ClientGraphState.activate(menu.containerId);
         // Fullscreen: use the entire window
         // Canvas area below the top strip (buttons + toasts)
         view.setViewport(this.width - PADDING_X * 2, this.height - PADDING_TOP - PADDING_BOTTOM);
@@ -111,9 +112,9 @@ public class GraphTerminalScreen extends Screen implements MenuAccess<GraphTermi
     }
 
     public void refreshFromState() {
-        PatternGraph g = ClientGraphState.current();
+        PatternGraph g = ClientGraphState.current(menu.containerId);
         if (g != null && g != view.getGraph()) {
-            view.setGraph(g);
+            view.setGraph(g, ClientGraphState.layoutFor(menu.containerId, g));
             hit = GraphRenderer.Hit.NONE; // stale hover indices must not leak into the new graph
         }
     }
@@ -126,9 +127,9 @@ public class GraphTerminalScreen extends Screen implements MenuAccess<GraphTermi
             this.minecraft.player.closeContainer();
             return;
         }
-        PatternGraph current = ClientGraphState.current();
+        PatternGraph current = ClientGraphState.current(menu.containerId);
         if (current != null && current != view.getGraph()) {
-            view.setGraph(current);
+            view.setGraph(current, ClientGraphState.layoutFor(menu.containerId, current));
             hit = GraphRenderer.Hit.NONE; // stale hover indices must not leak into the new graph
         }
     }
@@ -155,6 +156,7 @@ public class GraphTerminalScreen extends Screen implements MenuAccess<GraphTermi
         if (this.minecraft != null && this.minecraft.player != null) {
             menu.removed(this.minecraft.player);
         }
+        ClientGraphState.deactivate(menu.containerId);
         super.removed();
     }
 
@@ -166,7 +168,7 @@ public class GraphTerminalScreen extends Screen implements MenuAccess<GraphTermi
         g.drawString(this.font, this.title, PADDING_X + 2, 8, 0xFFFFFFFF);
 
         // Total pattern count read from the attached network (next to the title)
-        int patternCount = ClientGraphState.patternCount();
+        int patternCount = ClientGraphState.patternCount(menu.containerId);
         if (patternCount >= 0) {
             Component countText = Component.translatable(
                 "recipegraph.screen.graph_terminal.pattern_count", patternCount);
@@ -199,7 +201,7 @@ public class GraphTerminalScreen extends Screen implements MenuAccess<GraphTermi
                 if (!stack.isEmpty()) {
                     g.renderTooltip(this.font, stack, mouseX, mouseY);
                 } else {
-                    g.renderTooltip(this.font, GraphRenderer.displayName(hovered, stack), mouseX, mouseY);
+                    g.renderTooltip(this.font, GraphRenderer.displayName(hovered), mouseX, mouseY);
                 }
             }
         }
@@ -335,15 +337,24 @@ public class GraphTerminalScreen extends Screen implements MenuAccess<GraphTermi
     private void renderGraph(GuiGraphics g, int mouseX, int mouseY) {
         PatternGraph graph = view.getGraph();
         if (graph == null || graph.isEmpty()) {
-            // Show the reason why no graph is displayed
-            var msg = switch (ClientGraphState.status()) {
-                case GraphDataPacket.STATUS_NO_NETWORK ->
-                    Component.translatable("recipegraph.screen.graph_terminal.no_network");
-                case GraphDataPacket.STATUS_NO_PATTERNS ->
-                    Component.translatable("recipegraph.screen.graph_terminal.no_patterns");
-                default ->
-                    Component.translatable("recipegraph.screen.graph_terminal.empty");
-            };
+            // A freshly received non-empty graph is laid out in the background; don't tell
+            // the player "no patterns found" while that is happening.
+            Component msg;
+            if (ClientGraphState.layoutPending(menu.containerId)
+                    || !ClientGraphState.hasState(menu.containerId)) {
+                msg = Component.translatable("recipegraph.screen.graph_terminal.loading");
+            } else {
+                msg = switch (ClientGraphState.status(menu.containerId)) {
+                    case GraphDataPacket.STATUS_NO_NETWORK ->
+                        Component.translatable("recipegraph.screen.graph_terminal.no_network");
+                    case GraphDataPacket.STATUS_NO_PATTERNS ->
+                        Component.translatable("recipegraph.screen.graph_terminal.no_patterns");
+                    case GraphDataPacket.STATUS_ERROR ->
+                        Component.translatable("recipegraph.screen.graph_terminal.collect_error");
+                    default ->
+                        Component.translatable("recipegraph.screen.graph_terminal.empty");
+                };
+            }
             g.drawCenteredString(this.font, msg, this.width / 2, this.height / 2, 0xFF7A8290);
             return;
         }
@@ -552,13 +563,13 @@ public class GraphTerminalScreen extends Screen implements MenuAccess<GraphTermi
             ClientToast.push(Component.translatable("recipegraph.search.none", searchBox.getValue().trim()));
             return;
         }
-        GraphNode target = searchMatches.get(searchIndex % searchMatches.size());
+        int shown = searchIndex % searchMatches.size();
+        GraphNode target = searchMatches.get(shown);
         searchIndex++;
         view.focusOn(target);
         String name = materialName(target.primaryKeyId(), target.getLabel());
         ClientToast.push(Component.translatable("recipegraph.search.jump",
-            "(" + (searchIndex % searchMatches.size() == 0 ? searchMatches.size() : searchIndex % searchMatches.size())
-            + "/" + searchMatches.size() + ") " + name));
+            "(" + (shown + 1) + "/" + searchMatches.size() + ") " + name));
     }
 
     /** Localised display name for a material key id, falling back to the given literal. */

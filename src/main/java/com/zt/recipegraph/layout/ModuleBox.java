@@ -6,11 +6,12 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * A business module (Meta-Node): the visual rectangle that groups a set of material nodes.
+ * A business module: the visual rectangle that groups a set of recipe nodes.
  *
- * Modules are produced by the hierarchical layout: Louvain clusters are condensed by SCC
- * (cross-module cycles merge into super modules) and placed by the meta-graph Sugiyama pass
- * with raw materials on the right and products on the left.
+ * Modules are exactly the Louvain phase-1 communities (plus singleton boxes for
+ * unclustered nodes); communities larger than the configured cap are split into
+ * chunks. The meta-graph Sugiyama pass places the boxes with raw materials on the
+ * right and final products on the left.
  */
 public final class ModuleBox {
     public final int id;

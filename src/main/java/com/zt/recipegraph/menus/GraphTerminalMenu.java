@@ -17,11 +17,19 @@ import net.neoforged.neoforge.network.PacketDistributor;
  * Server-side container menu for the Graph Terminal.
  *
  * The menu carries no inventory slots (it's a pure viewer). The graph data is sent out-of-band
- * via a {@link com.zt.recipegraph.network.GraphDataPacket} from {@link GraphTerminalBlock#use}
- * when the menu is opened, and again when the client requests a rebuild.
+ * via a {@link com.zt.recipegraph.network.GraphDataPacket} from
+ * {@link GraphTerminalBlock#useWithoutItem} when the menu is opened, and again when the client
+ * requests a rebuild.
  */
 public class GraphTerminalMenu extends AbstractContainerMenu {
     private final BlockPos pos;
+    /**
+     * Server-side rebuild generation. Each collection response for this menu carries the
+     * generation it was started with; the client discards responses whose generation is
+     * older than the newest it has already applied. The initial graph sent when the menu
+     * opens uses generation 0.
+     */
+    private int generation;
 
     /** Server constructor. */
     public GraphTerminalMenu(int containerId, Inventory playerInv, BlockPos pos) {
@@ -34,9 +42,14 @@ public class GraphTerminalMenu extends AbstractContainerMenu {
         this(containerId, playerInv, buf.readBlockPos());
     }
 
+    /**
+     * The menu stays valid only while the terminal block entity still exists and the player
+     * is within 8 blocks of it (vanilla-style interaction range check).
+     */
     @Override
     public boolean stillValid(Player player) {
-        return true;
+        return player.level().getBlockEntity(pos) instanceof com.zt.recipegraph.blocks.GraphTerminalBlockEntity
+            && player.distanceToSqr(pos.getX() + 0.5, pos.getY() + 0.5, pos.getZ() + 0.5) <= 64.0;
     }
 
     @Override
@@ -46,6 +59,16 @@ public class GraphTerminalMenu extends AbstractContainerMenu {
 
     public BlockPos getPos() {
         return pos;
+    }
+
+    /** Current generation of this menu (0 for the graph sent at open time). */
+    public int getGeneration() {
+        return generation;
+    }
+
+    /** Advances to the next generation and returns it. Server side only. */
+    public int nextGeneration() {
+        return ++generation;
     }
 
     /**

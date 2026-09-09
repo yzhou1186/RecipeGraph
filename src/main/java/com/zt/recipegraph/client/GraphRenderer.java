@@ -24,6 +24,7 @@ import appeng.api.client.AEKeyRendering;
 import appeng.api.stacks.AEItemKey;
 import appeng.api.stacks.AEKey;
 
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -37,8 +38,10 @@ import java.util.Optional;
  * — OUTPUT ports on its LEFT (primary product) and INPUT ports on its RIGHT (consumed
  * materials). Each port is a small icon + name chip. The same material exists as a port on
  * every recipe that makes or consumes it: hovering one X port highlights EVERY X port and
- * all edges carrying X (bright amber, everything else dimmed). Edges are orthogonal
- * polylines routed by the layout, anchored at port coordinates.</p>
+ * all edges carrying X — warm amber for material LEAVING the hovered card (output side) and
+ * cool cyan for material ENTERING it (input side), everything else dimmed. The edge under
+ * the cursor is redrawn on the very top layer so cards/chips can never cover it. Edges are
+ * orthogonal polylines routed by the layout, anchored at port coordinates.</p>
  */
 public final class GraphRenderer {
 
@@ -56,7 +59,6 @@ public final class GraphRenderer {
     }
 
     private static final Map<String, ItemStack> STACK_CACHE = new HashMap<>();
-    private static final Map<String, Component> NAME_CACHE = new HashMap<>();
     /** Reconstructed generic AEKeys (gases, mana, data, ...) keyed by material key id; empty = none. */
     private static final Map<String, Optional<AEKey>> KEY_CACHE = new HashMap<>();
     /** Vertical distance between stacked ports, world units (must match HierarchicalLayout.PORT_ROW). */
@@ -68,11 +70,22 @@ public final class GraphRenderer {
 
     private static final int EDGE_SAME = 0xFF4FC3F7;   // intra-module: bright cyan
     private static final int EDGE_CROSS = 0xFF2C3340;  // cross-module: subtle grey
-    private static final int EDGE_HIGHLIGHT = 0xFFFFD54F; // hover/association: bright amber
+    private static final int EDGE_HIGHLIGHT = 0xFFFFD54F; // hover/output (material leaving): warm amber
+    private static final int EDGE_INPUT = 0xFF4FC3F7;  // material flowing INTO the hovered card: cool cyan
     private static final int CARD_FILL = 0xEE232A38;
     private static final int DIM_ALPHA = 0x48;
 
     private GraphRenderer() {}
+
+    /**
+     * Drops cached item stacks / AEKeys. Called whenever a new graph collection arrives so
+     * resolutions from a previous world, resource pack or registry snapshot cannot leak.
+     * Must be called on the client main thread (it is, from ClientGraphState).
+     */
+    public static void clearCaches() {
+        STACK_CACHE.clear();
+        KEY_CACHE.clear();
+    }
 
     /**
      * Draws the full graph.
@@ -109,8 +122,14 @@ public final class GraphRenderer {
         GraphNode hoverPortNode = null;
         boolean hoverPortOutput = false;
         GraphNode hoveredNode = null;
+        // One indexed copy shared by the hover hit-test (reverse order) and the card draw
+        // loop below (forward order).
+        List<GraphNode> nodeList = new ArrayList<>(graph.getNodes());
         if (mouseX >= 0) {
-            for (GraphNode n : graph.getNodes()) {
+            // Iterate in REVERSE draw order so the top-most card/port wins (nodes are
+            // drawn in list order, later ones paint over earlier ones).
+            for (int ni = nodeList.size() - 1; ni >= 0; ni--) {
+                GraphNode n = nodeList.get(ni);
                 int cx = (int) (offX + n.x * zoom);
                 int cy = (int) (offY + n.y * zoom);
                 if (cx < canvasX0 - 200 || cx > canvasX1 + 200 || cy < canvasY0 - 200 || cy > canvasY1 + 200) continue;
@@ -144,32 +163,38 @@ public final class GraphRenderer {
         boolean anyHover = hoverKey != null || hoveredNode != null || hoveredEdge >= 0;
 
         // 3a. CROSS-MODULE edges first (bottom layer) — these route outside boxes and
-        // must not obscure intra-module edges drawn inside boxes on top
+        // must not obscure intra-module edges drawn inside boxes on top.
+        // The hovered edge is skipped in BOTH passes and redrawn after the cards so it
+        // always floats on the very top layer (never covered by cards/chips/other edges).
         List<GraphEdge> edges = graph.getEdges();
         for (int ei = 0; ei < edges.size(); ei++) {
+            if (ei == hoveredEdge) continue;
             GraphEdge e = edges.get(ei);
             GraphNode a = e.getFrom();
             GraphNode b2 = e.getTo();
             boolean sameModule = (a.getCluster() == b2.getCluster() && a.getCluster() >= 0);
             if (sameModule) continue; // draw intra-module later
             drawEdge(g, font, a, b2, e, ei, edges, layout, offX, offY, zoom,
-                canvasX0, canvasY0, canvasX1, canvasY1, hoverKey, hoveredNode, hoveredEdge, anyHover, false);
+                canvasX0, canvasY0, canvasX1, canvasY1, hoverKey, hoveredNode, hoveredEdge,
+                anyHover, false, hoverPortNode);
         }
 
         // 3b. INTRA-MODULE edges on top (they live inside boxes and must be visible
         // above any cross-module edges that might happen to cross over)
         for (int ei = 0; ei < edges.size(); ei++) {
+            if (ei == hoveredEdge) continue;
             GraphEdge e = edges.get(ei);
             GraphNode a = e.getFrom();
             GraphNode b2 = e.getTo();
             boolean sameModule = (a.getCluster() == b2.getCluster() && a.getCluster() >= 0);
             if (!sameModule) continue;
             drawEdge(g, font, a, b2, e, ei, edges, layout, offX, offY, zoom,
-                canvasX0, canvasY0, canvasX1, canvasY1, hoverKey, hoveredNode, hoveredEdge, anyHover, true);
+                canvasX0, canvasY0, canvasX1, canvasY1, hoverKey, hoveredNode, hoveredEdge,
+                anyHover, true, hoverPortNode);
         }
 
         // 4. Recipe cards with port chips
-        for (GraphNode n : graph.getNodes()) {
+        for (GraphNode n : nodeList) {
             int cx = (int) (offX + n.x * zoom);
             int cy = (int) (offY + n.y * zoom);
             if (cx < canvasX0 - 200 || cx > canvasX1 + 200 || cy < canvasY0 - 200 || cy > canvasY1 + 200) continue;
@@ -203,6 +228,19 @@ public final class GraphRenderer {
             drawChips(g, font, n, n.inputs, false, offX, offY, zoom, hoverKey, anyHover);
             drawChips(g, font, n, n.outputs, true, offX, offY, zoom, hoverKey, anyHover);
         }
+
+        // 5. Hovered edge REDRAWN on the very top layer (above every card and chip) so
+        // the selected line is never covered. It was skipped in passes 3a/3b; on frames
+        // without a hover it is drawn normally there.
+        if (hoveredEdge >= 0 && hoveredEdge < edges.size()) {
+            GraphEdge e = edges.get(hoveredEdge);
+            GraphNode a = e.getFrom();
+            GraphNode b2 = e.getTo();
+            boolean sameModule = (a.getCluster() == b2.getCluster() && a.getCluster() >= 0);
+            drawEdge(g, font, a, b2, e, hoveredEdge, edges, layout, offX, offY, zoom,
+                canvasX0, canvasY0, canvasX1, canvasY1, hoverKey, hoveredNode, hoveredEdge,
+                anyHover, sameModule, hoverPortNode);
+        }
         return new Hit(hoveredNode, hoveredEdge, hoverPortKey, hoverPortNode, hoverPortOutput);
     }
 
@@ -231,9 +269,12 @@ public final class GraphRenderer {
             int textY = cy - 4;
 
             if (linked) {
+                // output (product leaving) chips warm amber, input (material entering) chips cool cyan
+                int linkedColor = outputSide ? EDGE_HIGHLIGHT : EDGE_INPUT;
                 int zoneX0 = outputSide ? cx - CHIP_W : cx - 2;
-                g.fill(zoneX0, cy - CHIP_H / 2, zoneX0 + CHIP_W, cy + CHIP_H / 2, 0x66FFD54F);
-                g.renderOutline(zoneX0, cy - CHIP_H / 2, CHIP_W, CHIP_H, EDGE_HIGHLIGHT);
+                g.fill(zoneX0, cy - CHIP_H / 2, zoneX0 + CHIP_W, cy + CHIP_H / 2,
+                        outputSide ? 0x66FFD54F : 0x664FC3F7);
+                g.renderOutline(zoneX0, cy - CHIP_H / 2, CHIP_W, CHIP_H, linkedColor);
             }
 
             ItemStack stack = resolveStack(p.keyId);
@@ -243,9 +284,11 @@ public final class GraphRenderer {
             } else if (key != null && drawKey(g, iconX, iconY, key)) {
                 // AE2 key icon (gas, fluid, mana, ...)
             } else {
-                g.fill(iconX + 2, iconY + 2, iconX + 14, iconY + 14, linked ? EDGE_HIGHLIGHT : 0xFF8E99A8);
+                g.fill(iconX + 2, iconY + 2, iconX + 14, iconY + 14,
+                        linked ? (outputSide ? EDGE_HIGHLIGHT : EDGE_INPUT) : 0xFF8E99A8);
             }
-            int textColor = dim ? 0x70A0A8B8 : (linked ? 0xFFFFD54F : 0xFFFFFFFF);
+            int textColor = dim ? 0x70A0A8B8
+                    : (linked ? (outputSide ? 0xFFFFD54F : 0xFF4FC3F7) : 0xFFFFFFFF);
             g.drawString(font, label, textX, textY, textColor);
         }
     }
@@ -332,10 +375,14 @@ public final class GraphRenderer {
         return Math.sqrt(ex * ex + ey * ey);
     }
 
-    /** Resolves the display name for a node (item/fluid/key localised name, or literal label).
-     *  Cached per node id — called every frame for every visible node. */
-    public static Component displayName(GraphNode n, ItemStack stack) {
-        return displayName(n.getId(), n.getLabel(), stack, resolveKey(n.primaryKeyId() != null ? n.primaryKeyId() : n.getId()));
+    /**
+     * Resolves the display name for a node (item/fluid/key localised name, or literal label).
+     * Delegates to the material key id — recipe node ids are re-sequenced on every collection
+     * and must not be used as cache keys.
+     */
+    public static Component displayName(GraphNode n) {
+        return displayNameForKey(
+            n.primaryKeyId() != null ? n.primaryKeyId() : n.getId(), n.getLabel());
     }
 
     /** Material name for a port key id, falling back to the supplied literal label. */
@@ -347,24 +394,14 @@ public final class GraphRenderer {
         return Component.literal(fallbackLabel);
     }
 
-    private static Component displayName(String id, String label, ItemStack stack, AEKey aeKey) {
-        return NAME_CACHE.computeIfAbsent(id, k -> {
-            if (!stack.isEmpty()) {
-                return stack.getHoverName();
-            }
-            if (aeKey != null) {
-                return aeKey.getDisplayName();
-            }
-            // Recipe nodes and unresolvable generic keys carry a literal localised label.
-            return Component.literal(label);
-        });
-    }
-
     /**
      * Rebuilds a generic {@link AEKey} from an id of the form {@code aekey:<SNBT>}, where
      * the SNBT payload is the key's AE2 codec form (written server-side via toTagGeneric,
      * including the full data-component map for items). Returns null for legacy ids or
      * when the key type is unavailable on the client.
+     *
+     * <p>Parse failures are cached (they are permanent), but a null level (e.g. main menu)
+     * is NOT cached — the id must be retried once a world is loaded.</p>
      */
     public static AEKey resolveKey(String id) {
         if (id == null || !id.startsWith("aekey:")) return null;
@@ -377,12 +414,14 @@ public final class GraphRenderer {
                 var level = Minecraft.getInstance().level;
                 if (level != null) {
                     key = AEKey.fromTagGeneric(level.registryAccess(), compoundTag);
+                    KEY_CACHE.put(id, Optional.ofNullable(key));
                 }
+                // level == null: skip caching so the key is resolved after joining a world
             }
         } catch (Throwable ignored) {
-            // Legacy "aekey:<type>:<id>" fallback ids or unloaded key types → null
+            // Legacy "aekey:<type>:<id>" fallback ids or unloaded key types → cache the miss
+            KEY_CACHE.put(id, Optional.empty());
         }
-        KEY_CACHE.put(id, Optional.ofNullable(key));
         return key;
     }
 
@@ -459,14 +498,22 @@ public final class GraphRenderer {
                                   double offX, double offY, double zoom,
                                   int canvasX0, int canvasY0, int canvasX1, int canvasY1,
                                   String hoverKey, GraphNode hoveredNode, int hoveredEdge, boolean anyHover,
-                                  boolean sameModule) {
+                                  boolean sameModule, GraphNode portNode) {
         int base = sameModule ? EDGE_SAME : EDGE_CROSS;
-        boolean highlighted =
-                (hoverKey != null && hoverKey.equals(e.getKeyId()))
-                || (hoveredNode != null && (a == hoveredNode || b2 == hoveredNode))
-                || hoveredEdge == ei;
-        int color = highlighted ? EDGE_HIGHLIGHT
-                : (anyHover ? ((base & 0x00FFFFFF) | (DIM_ALPHA << 24)) : base);
+        boolean isHoveredEdge = hoveredEdge == ei;
+        boolean keyMatch = hoverKey != null && hoverKey.equals(e.getKeyId());
+        boolean nodeHover = hoveredNode != null && (a == hoveredNode || b2 == hoveredNode);
+        int color;
+        if (isHoveredEdge || nodeHover) {
+            color = EDGE_HIGHLIGHT;
+        } else if (keyMatch) {
+            // Material matches the hovered port: cool cyan when the material flows INTO
+            // the hovered card (input side), warm amber when it leaves it or merely
+            // associates with the same material elsewhere in the graph.
+            color = (portNode != null && b2 == portNode) ? EDGE_INPUT : EDGE_HIGHLIGHT;
+        } else {
+            color = anyHover ? ((base & 0x00FFFFFF) | (DIM_ALPHA << 24)) : base;
+        }
         double[] pts = layout.routeOf(ei);
         if (pts == null || pts.length < 4) {
             pts = new double[]{a.x, a.y, b2.x, b2.y};

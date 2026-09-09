@@ -43,6 +43,7 @@ public record RequestRebuildPacket(int containerId) implements CustomPacketPaylo
         AbstractContainerMenu menu = player.containerMenu;
         if (menu == null || menu.containerId != containerId) return;
         if (!(menu instanceof com.zt.recipegraph.menus.GraphTerminalMenu gtMenu)) return;
-        com.zt.recipegraph.blocks.GraphTerminalBlock.sendGraph(player, player.level(), gtMenu.getPos());
+        com.zt.recipegraph.blocks.GraphTerminalBlock.sendGraph(
+            player, player.level(), gtMenu.getPos(), gtMenu.containerId, gtMenu.nextGeneration());
     }
 }

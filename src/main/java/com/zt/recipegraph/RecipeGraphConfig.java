@@ -17,38 +17,28 @@ public final class RecipeGraphConfig {
 
     private static final ModConfigSpec.Builder BUILDER = new ModConfigSpec.Builder();
 
-    /** Maximum number of modules in a super-component (SCC merge cap). Range 3-100, default 42. */
+    /** Maximum number of recipes per module box (split cap). Range 3-100, default 42. */
     public static final ModConfigSpec.IntValue MAX_MODULE_SIZE = BUILDER
-        .comment("Maximum number of modules allowed in a merged super-component (SCC). " +
-                "Larger values pack more cycles into one box; smaller values keep SCCs compact " +
-                "but may leave mega-SCCs unmerged. Range [3, 100].")
+        .comment("Maximum number of recipes allowed in one module box (the \"(N 项)\" count " +
+                "in a box title). Communities larger than this are split into chunks of at " +
+                "most this size. Range [3, 100].")
         .defineInRange("maxModuleSize", 42, 3, 100);
-
-    /** Number of collision-separation iterations for node AABB resolution. Range 50-200, default 50. */
-    public static final ModConfigSpec.IntValue AABB_ITERATIONS = BUILDER
-        .comment("Number of AABB collision-separation iterations performed after layout. " +
-                "More iterations give cleaner separation but take longer on large graphs. " +
-                "Range [50, 200].")
-        .defineInRange("aabbIterations", 50, 50, 200);
 
     public static final ModConfigSpec SPEC = BUILDER.build();
 
     private RecipeGraphConfig() {}
 
     /** Registers the common config spec with the given mod container.
-     *  Must be called from the mod constructor. */
+     *  Must be called from the mod constructor. The explicit file name pins the config to
+     *  config/recipegraph.toml instead of the default recipegraph-common.toml. */
     public static void register(ModContainer container) {
-        container.registerConfig(ModConfig.Type.COMMON, SPEC);
+        container.registerConfig(ModConfig.Type.COMMON, SPEC, "recipegraph.toml");
     }
 
     /** Clamped accessor — always returns a value within the declared range even if the
      *  on-disk config was manually edited out of bounds. */
     public static int maxModuleSize() {
         return clamp(MAX_MODULE_SIZE.get(), 3, 100);
-    }
-
-    public static int aabbIterations() {
-        return clamp(AABB_ITERATIONS.get(), 50, 200);
     }
 
     private static int clamp(int v, int lo, int hi) {

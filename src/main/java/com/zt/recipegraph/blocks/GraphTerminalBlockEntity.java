@@ -74,8 +74,9 @@ public class GraphTerminalBlockEntity extends BlockEntity implements IGridConnec
 
     @Override
     public void setOwner(Player player) {
-        if (level != null && !level.isClientSide && player != null) {
-            int playerId = appeng.api.features.IPlayerRegistry.getPlayerId((net.minecraft.server.level.ServerPlayer) player);
+        if (level != null && !level.isClientSide
+            && player instanceof net.minecraft.server.level.ServerPlayer serverPlayer) {
+            int playerId = appeng.api.features.IPlayerRegistry.getPlayerId(serverPlayer);
             if (playerId >= 0) {
                 mainNode.setOwningPlayerId(playerId);
             }

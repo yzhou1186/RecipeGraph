@@ -6,29 +6,40 @@ import com.zt.recipegraph.graph.PatternGraph;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
+import java.util.Set;
 
 /**
- * Louvain community detection algorithm (Blondel et al., 2008).
+ * Louvain-style community detection — the LOCAL MOVING phase only (Blondel et al., 2008).
  *
- * Louvain is a greedy, modularity-based method that repeatedly:
- * 1. Local phase: For each node, evaluate the modularity gain of moving it from its current
- *    community to a neighbour's community. Move it to the one giving the greatest positive gain.
- * 2. Aggregation phase: Build a new weighted graph where each community becomes a single node,
- *    and edges between communities become weighted edges. Self-loops capture internal edge weights.
+ * <p>Repeated random-order sweeps visit each node and evaluate the modularity gain of moving
+ * it from its current community into each neighbour community; the node moves to the one
+ * giving the greatest strictly-positive gain. Sweeps repeat until a full sweep moves nothing
+ * (a locally optimal partition) or {@link #MAX_LOCAL_SWEEPS} is reached. The graph is treated
+ * as undirected and weighted: PatternGraph stores a symmetric weight per node pair (parallel
+ * pattern edges add up).</p>
  *
- * The two phases iterate until modularity stops improving.
+ * <p><b>Why the aggregation phase is intentionally absent.</b> Classic Louvain follows the
+ * local phase with a contraction phase (communities become super-nodes, then local moving
+ * repeats on the quotient graph). Contracting correctly requires carrying intra-community
+ * edge weights as super-node SELF-LOOPS — they are the communities' internal mass and must
+ * stay inside {@code sigmaTot} and {@code m}; otherwise the modularity penalty
+ * {@code sigmaTot[c]·k_i/(2m²)} is computed as if communities had no internal edges, and from
+ * the second level on merging almost any two connected super-nodes shows a positive gain.
+ * Measured on the 605-recipe / 1395-edge modpack graph, the level-1 partition coarsens
+ * 145 → 28 → 7 → 2 → 1 community in four levels (every recipe ends in ONE box, which the
+ * oversize splitter then slices into cap-sized chunks, cutting ~98% of intra-community edges
+ * and leaving nearly every chunk a single unrelated column). The level-0 local-moving
+ * partition, by contrast, is the fine-grained grouping the whole layout (box cap, meta
+ * Sugiyama layering, routing) is built for — ~150 small coherent recipe groups — and is a
+ * fully valid Louvain phase-1 optimum. We therefore stop there rather than retain self-loops
+ * and coarsen into a handful of oversized communities.</p>
  *
- * Implementation notes:
- * - Treats the graph as undirected and weighted. The {@link PatternGraph} already stores symmetric
- *   edge weights between pairs of nodes.
- * - The implementation is purely in-memory and operates on the ids returned by {@link GraphNode#getId()}.
- * - Result is written into {@link GraphNode#setCluster(int)}.
- *
- * This class is intentionally self-contained (no external Java features beyond collections and
- * {@link Random}) so it can be transplanted to other Java versions (8+) without changes.
+ * <p>Determinism is provided by a fixed random seed ({@code 42}); all other ordering is
+ * stable.</p>
  */
 public final class LouvainClustering {
     private final PatternGraph graph;
@@ -43,124 +54,95 @@ public final class LouvainClustering {
         this.random = new Random(seed);
     }
 
+    /** Maximum full local-phase sweeps. */
+    private static final int MAX_LOCAL_SWEEPS = 50;
+
     /**
-     * Runs the algorithm and returns the number of distinct communities found.
+     * Runs the local moving phase and returns the number of distinct communities found.
      * The result is assigned to {@link GraphNode#setCluster(int)} on every node.
      */
     public int run() {
         graph.resetClusters();
-        if (graph.isEmpty()) {
-            return 0;
-        }
+        List<GraphNode> nodes = new ArrayList<>(graph.getNodes());
+        int n = nodes.size();
+        if (n == 0) return 0;
 
-        // Build internal node index
-        List<String> nodeIds = new ArrayList<>();
         Map<String, Integer> indexOf = new HashMap<>();
-        for (GraphNode n : graph.getNodes()) {
-            indexOf.put(n.getId(), nodeIds.size());
-            nodeIds.add(n.getId());
-        }
-        int n = nodeIds.size();
+        for (int i = 0; i < n; i++) indexOf.put(nodes.get(i).getId(), i);
 
-        // Build neighbour list and weighted degrees using the (symmetric) weights from the graph
-        // (so a directed edge from A->B contributes the same as B->A).
-        double[] k = new double[n]; // weighted degree of each node
-        double m2 = 0;               // 2 * total weight (sum of degrees)
-        // Use adjacency list of nodes
-        List<List<Integer>> neighbours = new ArrayList<>(n);
+        // Undirected weighted adjacency of the ORIGINAL nodes. getNeighbours() may contain
+        // duplicate entries (parallel pattern edges add each endpoint repeatedly); weights
+        // come from PatternGraph's symmetric pair-weight index (parallel edges summed).
+        List<List<Integer>> adj = new ArrayList<>(n);
         List<List<Double>> weights = new ArrayList<>(n);
+        double[] deg = new double[n];
         for (int i = 0; i < n; i++) {
-            neighbours.add(new ArrayList<>());
+            adj.add(new ArrayList<>());
             weights.add(new ArrayList<>());
         }
-
-        // Add an edge for every ordered pair from the underlying undirected graph
-        for (GraphNode node : graph.getNodes()) {
-            int i = indexOf.get(node.getId());
-            for (GraphNode nb : graph.getNeighbours(node.getId())) {
+        for (int i = 0; i < n; i++) {
+            Set<Integer> seen = new HashSet<>();
+            for (GraphNode nb : graph.getNeighbours(nodes.get(i).getId())) {
                 int j = indexOf.get(nb.getId());
-                if (i == j) continue;
-                double w = graph.getEdgeWeight(node.getId(), nb.getId());
-                // Deduplicate (graph adjacency stores both directions once per edge)
-                if (!neighbours.get(i).contains(j)) {
-                    neighbours.get(i).add(j);
-                    weights.get(i).add(w);
-                    k[i] += w;
-                    m2 += w;
-                }
+                if (j == i || !seen.add(j)) continue;
+                double w = graph.getEdgeWeight(nodes.get(i).getId(), nodes.get(j).getId());
+                adj.get(i).add(j);
+                weights.get(i).add(w);
+                deg[i] += w;
             }
         }
 
-        // The aggregation above may double-count: we walk both endpoints of every edge.
-        // In practice, with the symmetric weight map in PatternGraph, each (i, j) pair only
-        // gets registered once because adjacency lists contain j when walking from i, and we
-        // avoid re-adding by checking contains. The total m2 is then sum of degrees' half:
-        double m = m2 / 2.0; // total weight
-        if (m == 0) {
-            // No edges: each node is its own cluster
-            int c = 0;
-            for (GraphNode node : graph.getNodes()) {
-                node.setCluster(c++);
-            }
-            return c;
-        }
+        double m = 0;
+        for (double d : deg) m += d;
+        m /= 2.0;
 
-        // Initial: every node in its own community
         int[] community = new int[n];
         for (int i = 0; i < n; i++) community[i] = i;
 
-        // Sum of weights of edges inside community c
-        double[] sigmaIn = new double[n];
-        // Sum of weights of edges incident to community c
-        double[] sigmaTot = new double[n];
-        for (int i = 0; i < n; i++) {
-            sigmaIn[i] = 0; // no self-loops initially
-            sigmaTot[i] = k[i];
+        if (m > 0) {
+            localPhase(adj, weights, deg, community, m);
         }
+        int communityCount = remap(community);
+        for (int i = 0; i < n; i++) nodes.get(i).setCluster(community[i]);
+        return communityCount;
+    }
 
-        boolean improved = true;
-        int iterations = 0;
-        while (improved && iterations < 20) {
-            improved = false;
-            iterations++;
-            // Random order
-            List<Integer> order = new ArrayList<>(n);
-            for (int i = 0; i < n; i++) order.add(i);
+    /**
+     * Greedy local phase. Repeated random-order sweeps move each node into the neighbour
+     * community with the greatest positive modularity gain until no move occurs.
+     */
+    private boolean localPhase(List<List<Integer>> adj, List<List<Double>> weights, double[] deg,
+                               int[] community, double m) {
+        int curN = adj.size();
+        double[] sigmaTot = deg.clone();
+        boolean anyMoved = false;
+
+        for (int sweep = 0; sweep < MAX_LOCAL_SWEEPS; sweep++) {
+            boolean movedThisSweep = false;
+            List<Integer> order = new ArrayList<>(curN);
+            for (int i = 0; i < curN; i++) order.add(i);
             Collections.shuffle(order, random);
 
             for (int idx : order) {
-                int bestCommunity = community[idx];
-                double bestGain = 0;
                 int currentCommunity = community[idx];
-
-                // Sum of weights from i to nodes in community c
+                // Sum of weights from idx to nodes in each neighbouring community.
                 Map<Integer, Double> d = new HashMap<>();
-                for (int e = 0; e < neighbours.get(idx).size(); e++) {
-                    int j = neighbours.get(idx).get(e);
+                for (int e = 0; e < adj.get(idx).size(); e++) {
+                    int j = adj.get(idx).get(e);
                     double w = weights.get(idx).get(e);
-                    int jc = community[j];
-                    d.merge(jc, w, Double::sum);
+                    d.merge(community[j], w, Double::sum);
                 }
+                double kI = deg[idx];
+                double dCurrent = d.getOrDefault(currentCommunity, 0.0);
+                double curTotAfterRemove = sigmaTot[currentCommunity] - kI;
 
-                // Pre-compute currentSigmaIn removals
-                double k_i = k[idx];
-                // d_{i, currentCommunity} = weights to current community (minus self)
-                double d_i_current = d.getOrDefault(currentCommunity, 0.0);
-
-                // Compute removal contribution: ΔQ_remove = -[ (sigmaIn - d_i_current)/(2m) -
-                //   ((sigmaTot - k_i)/(2m))^2 + (sigmaIn/(2m) - (sigmaTot/(2m))^2 - (k_i/(2m))^2) ]
-                // The standard formulation picks the best neighbouring community by computing
-                // the gain of moving i into c. The simplified update gain used here is:
-                //   gain = d_{i,c}/m - (sigmaTot[c] * k_i) / (2 m^2)
-                // compared against the gain of staying.
-
-                // Candidate communities (the ones neighbouring i)
-                for (int c : d.keySet()) {
+                int bestCommunity = currentCommunity;
+                double bestGain = 0;
+                for (Map.Entry<Integer, Double> en : d.entrySet()) {
+                    int c = en.getKey();
                     if (c == currentCommunity) continue;
-                    double d_i_c = d.get(c);
-                    double gainRemove = d_i_current - (sigmaTot[currentCommunity] * k_i) / (2 * m * m);
-                    double gainAdd = d_i_c - (sigmaTot[c] * k_i) / (2 * m * m);
-                    double gain = gainAdd - gainRemove;
+                    double gain = (en.getValue() - dCurrent) / m
+                        - (sigmaTot[c] - curTotAfterRemove) * kI / (2 * m * m);
                     if (gain > bestGain + 1e-12) {
                         bestGain = gain;
                         bestCommunity = c;
@@ -168,36 +150,33 @@ public final class LouvainClustering {
                 }
 
                 if (bestCommunity != currentCommunity) {
-                    // Move i from currentCommunity -> bestCommunity
-                    sigmaIn[currentCommunity] -= 2 * d_i_current; // edges from i inside current community
-                    sigmaTot[currentCommunity] -= k_i;
-                    double d_i_best = d.getOrDefault(bestCommunity, 0.0);
-                    sigmaIn[bestCommunity] += 2 * d_i_best;
-                    sigmaTot[bestCommunity] += k_i;
+                    sigmaTot[currentCommunity] -= kI;
+                    sigmaTot[bestCommunity] += kI;
                     community[idx] = bestCommunity;
-                    improved = true;
+                    movedThisSweep = true;
                 }
             }
-        }
 
-        // Renumber communities to be 0..k-1 contiguous (since some may be empty after moves)
+            anyMoved |= movedThisSweep;
+            if (!movedThisSweep) break;
+        }
+        return anyMoved;
+    }
+
+    /** Renumbers community labels to 0..count-1 and returns the number of communities. */
+    private static int remap(int[] community) {
         Map<Integer, Integer> remap = new HashMap<>();
-        int nextId = 0;
-        for (int i = 0; i < n; i++) {
+        int next = 0;
+        for (int i = 0; i < community.length; i++) {
             Integer mapped = remap.get(community[i]);
             if (mapped == null) {
-                remap.put(community[i], nextId);
-                community[i] = nextId;
-                nextId++;
+                remap.put(community[i], next);
+                community[i] = next;
+                next++;
             } else {
                 community[i] = mapped;
             }
         }
-        // Apply back to graph nodes
-        for (GraphNode node : graph.getNodes()) {
-            int i = indexOf.get(node.getId());
-            node.setCluster(community[i]);
-        }
-        return remap.size();
+        return next;
     }
 }

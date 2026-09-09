@@ -14,19 +14,11 @@ public final class GraphEdge {
     private final GraphNode to;
     /** Material AEKey id flowing through this edge (matches a Port.keyId on both sides). */
     private final String keyId;
-    private final double weight;        // typically 1, but can be boosted for shared materials
-    private final int amount;           // amount transferred (for display)
 
     public GraphEdge(GraphNode from, GraphNode to, String keyId) {
-        this(from, to, keyId, 1.0, 1);
-    }
-
-    public GraphEdge(GraphNode from, GraphNode to, String keyId, double weight, int amount) {
         this.from = from;
         this.to = to;
         this.keyId = keyId;
-        this.weight = weight;
-        this.amount = amount;
     }
 
     public GraphNode getFrom() {
@@ -40,18 +32,5 @@ public final class GraphEdge {
     /** Material key id carried by this edge (same as the linked ports' keyId). */
     public String getKeyId() {
         return keyId;
-    }
-
-    /** Legacy alias used by some callers; returns the material key id. */
-    public String getPatternId() {
-        return keyId;
-    }
-
-    public double getWeight() {
-        return weight;
-    }
-
-    public int getAmount() {
-        return amount;
     }
 }

@@ -12,6 +12,7 @@ out/
 .settings/
 .classpath
 .project
+.eclipse/
 bin/
 
 # Minecraft / NeoForge runtime

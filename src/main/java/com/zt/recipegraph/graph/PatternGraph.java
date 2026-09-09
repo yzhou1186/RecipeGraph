@@ -26,11 +26,7 @@ public final class PatternGraph {
     private double minY = Double.POSITIVE_INFINITY, maxY = Double.NEGATIVE_INFINITY;
 
     public GraphNode getOrCreateNode(String id, String label) {
-        return getOrCreateNode(id, label, id);
-    }
-
-    public GraphNode getOrCreateNode(String id, String label, String displayId) {
-        return nodesById.computeIfAbsent(id, k -> new GraphNode(id, label, displayId));
+        return nodesById.computeIfAbsent(id, k -> new GraphNode(id, label));
     }
 
     public GraphNode getNode(String id) {
@@ -80,9 +76,6 @@ public final class PatternGraph {
 
         adjacency.computeIfAbsent(from.getId(), k -> new ArrayList<>()).add(to);
         adjacency.computeIfAbsent(to.getId(), k -> new ArrayList<>()).add(from);
-
-        from.outDegree++;
-        to.inDegree++;
     }
 
     /** Resets the cluster id of every node to -1. Useful before running a new clustering pass. */

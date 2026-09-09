@@ -36,6 +36,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -110,10 +111,13 @@ public final class GraphExporter {
 
         try {
             double pad = 160.0;
-            double minX = Math.min(layout.getMinX(), g.getMinX()) - pad;
-            double minY = Math.min(layout.getMinY(), g.getMinY()) - pad;
-            double maxX = Math.max(layout.getMaxX(), g.getMaxX()) + pad;
-            double maxY = Math.max(layout.getMaxY(), g.getMaxY()) + pad;
+            // Include every route coordinate (bottom rails and channel tracks live outside
+            // the module rectangles) so wide/cyclic graphs are never clipped on export.
+            double[] bb = exportBounds(layout, g);
+            double minX = bb[0] - pad;
+            double minY = bb[1] - pad;
+            double maxX = bb[2] + pad;
+            double maxY = bb[3] + pad;
             double W = Math.ceil(maxX - minX);
             double H = Math.ceil(maxY - minY);
 
@@ -181,10 +185,35 @@ public final class GraphExporter {
                     sb.append(f(pts[i] + ox)).append(',').append(f(pts[i + 1] + oy));
                 }
                 sb.append("\" fill=\"none\" stroke=\"").append(stroke)
-                  .append("\" stroke-width=\"1\" marker-end=\"").append(marker).append("\"/>\n");
+                  .append("\" stroke-width=\"1\"/>\n");
+
+                // The layout anchors routes at the OUTER edge of the on-screen port chips
+                // (the labels/icons are drawn by the GUI between card and route). SVG has no
+                // chips, so connect the first/last route points back to the card edges with
+                // short orthogonal stubs; the arrowhead sits on the consumer card edge where
+                // the material actually enters.
+                double sx = pts[0];
+                double sy = pts[1];
+                double ex = pts[pts.length - 2];
+                double ey = pts[pts.length - 1];
+                double producerEdgeX = a.portX(true);
+                double consumerEdgeX = b2.portX(false);
+                if (Math.abs(producerEdgeX - sx) > 0.5) {
+                    sb.append("<line x1=\"").append(f(producerEdgeX + ox)).append("\" y1=\"").append(f(sy + oy))
+                      .append("\" x2=\"").append(f(sx + ox)).append("\" y2=\"").append(f(sy + oy))
+                      .append("\" stroke=\"").append(stroke).append("\" stroke-width=\"1\"/>\n");
+                }
+                if (Math.abs(consumerEdgeX - ex) > 0.5) {
+                    sb.append("<line x1=\"").append(f(ex + ox)).append("\" y1=\"").append(f(ey + oy))
+                      .append("\" x2=\"").append(f(consumerEdgeX + ox)).append("\" y2=\"").append(f(ey + oy))
+                      .append("\" stroke=\"").append(stroke).append("\" stroke-width=\"1\"")
+                      .append(" marker-end=\"").append(marker).append("\"/>\n");
+                }
             }
 
             // --- recipe cards: card rect (sized by the layout) + product icon + name ---
+            // Each card is wrapped in a <g> whose FIRST child is a <title> carrying the
+            // full untruncated product name, so SVG viewers show a native hover tooltip.
             double iconW = ICON_PX;
             for (GraphNode n : g.getNodes()) {
                 double x = n.x + ox;
@@ -194,9 +223,12 @@ public final class GraphExporter {
                 String colHex = (n.getCluster() >= 0)
                     ? toHex(GraphRenderer.clusterColor(n.getCluster()))
                     : "#B0B8C0";
+                String fullName = GraphRenderer.displayName(n).getString();
+
+                sb.append("<g>\n  <title>").append(xmlEscape(fullName)).append("</title>\n");
 
                 // Card rect (dark fill, coloured outline — same look as the in-game card)
-                sb.append("<rect x=\"").append(f(x - w / 2)).append("\" y=\"").append(f(y - h / 2))
+                sb.append("  <rect x=\"").append(f(x - w / 2)).append("\" y=\"").append(f(y - h / 2))
                   .append("\" width=\"").append(f(w)).append("\" height=\"").append(f(h))
                   .append("\" rx=\"6\" ry=\"6\" fill=\"#232A38\" fill-opacity=\"0.92\"")
                   .append(" stroke=\"").append(colHex).append("\" stroke-width=\"1.5\"/>\n");
@@ -204,39 +236,33 @@ public final class GraphExporter {
                 // Product icon (if available) at card centre
                 String uri = iconUriCache.get(n.getId());
                 if (uri != null && uri.startsWith("data:image/png;base64,")) {
-                    sb.append("<image x=\"").append(f(x - iconW / 2)).append("\" y=\"").append(f(y - iconW / 2))
+                    sb.append("  <image x=\"").append(f(x - iconW / 2)).append("\" y=\"").append(f(y - iconW / 2))
                       .append("\" width=\"").append(f(iconW)).append("\" height=\"").append(f(iconW))
                       .append("\" href=\"").append(uri).append("\" preserveAspectRatio=\"xMidYMid meet\"/>\n");
                 } else {
                     // fallback: coloured square for unknown types
-                    sb.append("<rect x=\"").append(f(x - ICON_PX / 2.0)).append("\" y=\"").append(f(y - ICON_PX / 2.0))
+                    sb.append("  <rect x=\"").append(f(x - ICON_PX / 2.0)).append("\" y=\"").append(f(y - ICON_PX / 2.0))
                       .append("\" width=\"").append(f(ICON_PX)).append("\" height=\"").append(f(ICON_PX))
                       .append("\" fill=\"").append(colHex).append("\" stroke=\"#000\"/>\n");
                 }
 
-                // Product name at the top strip of the card
-                String pid = n.primaryKeyId();
-                ItemStack stack = pid != null ? GraphRenderer.resolveStack(pid) : ItemStack.EMPTY;
-                String name = GraphRenderer.displayName(n, stack).getString();
+                // Product name at the top strip of the card (truncated; full name is in <title>)
+                String name = fullName;
                 int maxChars = 12;
                 if (name.length() > maxChars) name = name.substring(0, maxChars - 1) + "…";
-                sb.append("<text x=\"").append(f(x)).append("\" y=\"").append(f(y - h / 2 + 12))
+                sb.append("  <text x=\"").append(f(x)).append("\" y=\"").append(f(y - h / 2 + 12))
                   .append("\" text-anchor=\"middle\" dominant-baseline=\"middle\"")
                   .append(" font-family=\"Microsoft YaHei, PingFang SC, sans-serif\" font-size=\"12\" fill=\"#FFFFFF\"")
                   .append(">").append(xmlEscape(name)).append("</text>\n");
 
-                sb.append("<title>").append(xmlEscape(GraphRenderer.displayName(n, stack).getString())).append("</title>\n");
+                sb.append("</g>\n");
             }
 
             sb.append("</svg>\n");
 
             File dir = new File(mc.gameDirectory, "recipegraph");
-            Files.createDirectories(dir.toPath());
             Path file = new File(dir, "recipegraph-graph-" + System.currentTimeMillis() + ".svg").toPath();
-            Files.writeString(file, sb.toString(), StandardCharsets.UTF_8);
-            Component ok = Component.translatable("recipegraph.export.svg.success", file.toString());
-            overlay(mc, ok);
-            ClientToast.push(ok);
+            writeFileAsync(mc, file, sb.toString(), "recipegraph.export.svg.success");
         } catch (Throwable t) {
             Component err = Component.translatable("recipegraph.export.failed", String.valueOf(t.getMessage()));
             overlay(mc, err);
@@ -245,13 +271,28 @@ public final class GraphExporter {
     }
 
     /**
-     * Renders one item stack icon by sampling its BakedModel's particle sprite directly
-     * from the TextureAtlas that lives on the GPU. This is a pure "read pixels from a
-     * known texture" operation — no GuiGraphics, no FBO switching, no projection matrix
-     * fiddling. It works whenever the Minecraft renderer has already uploaded its atlas
-     * textures (i.e. any time the player can see items in their inventory).
+     * Downloaded pixels of one atlas texture. Keeping the {@link AbstractTexture} reference
+     * lets us detect resource reloads: when the texture manager swaps in a NEW instance for
+     * the same location, the cached pixels are stale and get re-downloaded.
      */
-    private static final Map<net.minecraft.resources.ResourceLocation, NativeImage> ATLAS_CACHE = new HashMap<>();
+    private record CachedAtlas(AbstractTexture tex, NativeImage image) {}
+
+    private static final Map<net.minecraft.resources.ResourceLocation, CachedAtlas> ATLAS_CACHE = new HashMap<>();
+
+    /**
+     * Finished base64 PNG data URIs, keyed by (atlas texture identity + sprite + tint).
+     * Exporting one big graph then exporting again (or exporting a graph sharing items with
+     * a previous one) is the common case; caching the completed URI skips the per-icon pixel
+     * copy, PNG encode and temp-file round-trip entirely on later runs. Bounded LRU because
+     * these strings are embedded in files and never needed again after the graph changes.
+     */
+    private static final int MAX_PNG_URI_CACHE = 4_096;
+    private static final Map<String, String> PNG_URI_CACHE = new LinkedHashMap<>(256, 0.75f, true) {
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<String, String> eldest) {
+            return size() > MAX_PNG_URI_CACHE;
+        }
+    };
 
     private static String renderItemIconToDataUri(Minecraft mc, ItemStack stack) {
         try {
@@ -298,10 +339,22 @@ public final class GraphExporter {
             int spriteH = sprite.contents().height();
             if (spriteW <= 0 || spriteH <= 0) return "";
 
-            // --- Download or retrieve the full atlas image (once per atlas location) ---
-            NativeImage atlasImg = ATLAS_CACHE.get(atlasLoc);
+            // Texture identity is part of the key so a resource reload (which swaps in a new
+            // AbstractTexture for the same location) automatically misses the cache.
+            String cacheKey = atlasLoc + "#" + sprite.contents().name() + "#"
+                + Integer.toHexString(tintARGB) + "#" + System.identityHashCode(
+                    mc.getTextureManager().getTexture(atlasLoc));
+            String cachedUri = PNG_URI_CACHE.get(cacheKey);
+            if (cachedUri != null) return cachedUri;
+
+            // --- Download or retrieve the full atlas image (once per atlas texture) ---
+            CachedAtlas atlasCached = ATLAS_CACHE.get(atlasLoc);
+            NativeImage atlasImg = null;
+            AbstractTexture tex = (AbstractTexture) mc.getTextureManager().getTexture(atlasLoc);
+            if (atlasCached != null && atlasCached.tex() == tex) {
+                atlasImg = atlasCached.image();
+            }
             if (atlasImg == null) {
-                AbstractTexture tex = (AbstractTexture) mc.getTextureManager().getTexture(atlasLoc);
                 if (tex == null) return "";
                 int texId = tex.getId();
                 org.lwjgl.opengl.GL11.glBindTexture(org.lwjgl.opengl.GL11.GL_TEXTURE_2D, texId);
@@ -317,7 +370,10 @@ public final class GraphExporter {
                 atlasImg = new NativeImage(NativeImage.Format.RGBA, atlasW, atlasH, false);
                 atlasImg.downloadTexture(0, false);
                 org.lwjgl.opengl.GL11.glBindTexture(org.lwjgl.opengl.GL11.GL_TEXTURE_2D, 0);
-                ATLAS_CACHE.put(atlasLoc, atlasImg);
+                if (atlasCached != null) {
+                    try { atlasCached.image().close(); } catch (Throwable ignored) {}
+                }
+                ATLAS_CACHE.put(atlasLoc, new CachedAtlas(tex, atlasImg));
             }
 
             // Compute the pixel rectangle inside the atlas image (U/V in [0,1] of atlas dims)
@@ -360,7 +416,9 @@ public final class GraphExporter {
             tmpFile = Files.createTempFile("rt_icon_", ".png");
             out.writeToFile(tmpFile);
             byte[] bytes = Files.readAllBytes(tmpFile);
-            return "data:image/png;base64," + Base64.getEncoder().encodeToString(bytes);
+            String uri = "data:image/png;base64," + Base64.getEncoder().encodeToString(bytes);
+            PNG_URI_CACHE.put(cacheKey, uri);
+            return uri;
         } catch (Throwable t) {
             return "";
         } finally {
@@ -403,8 +461,7 @@ public final class GraphExporter {
             for (GraphNode n : g.getNodes()) {
                 JsonObject no = new JsonObject();
                 no.addProperty("id", n.getId());
-                ItemStack stack = GraphRenderer.resolveStack(n);
-                no.addProperty("name", GraphRenderer.displayName(n, stack).getString());
+                no.addProperty("name", GraphRenderer.displayName(n).getString());
                 no.addProperty("x", n.x);
                 no.addProperty("y", n.y);
                 no.addProperty("module", n.getCluster());
@@ -419,7 +476,7 @@ public final class GraphExporter {
                 JsonObject eo = new JsonObject();
                 eo.addProperty("from", e.getFrom().getId());
                 eo.addProperty("to", e.getTo().getId());
-                eo.addProperty("pattern", e.getPatternId());
+                eo.addProperty("material", e.getKeyId());
                 double[] pts = layout.routeOf(ei);
                 if (pts != null) {
                     JsonArray arr = new JsonArray();
@@ -433,13 +490,8 @@ public final class GraphExporter {
             String json = new GsonBuilder().setPrettyPrinting().create().toJson(root);
 
             File dir = new File(mc.gameDirectory, "recipegraph");
-            Files.createDirectories(dir.toPath());
             Path file = new File(dir, "recipegraph-graph-" + System.currentTimeMillis() + ".json").toPath();
-            Files.writeString(file, json, StandardCharsets.UTF_8);
-
-            Component ok = Component.translatable("recipegraph.export.json.success", file.toString());
-            overlay(mc, ok);
-            ClientToast.push(ok);
+            writeFileAsync(mc, file, json, "recipegraph.export.json.success");
         } catch (Throwable t) {
             Component err = Component.translatable("recipegraph.export.failed", String.valueOf(t.getMessage()));
             overlay(mc, err);
@@ -451,12 +503,70 @@ public final class GraphExporter {
         if (mc.gui != null) mc.gui.setOverlayMessage(msg, false);
     }
 
+    /**
+     * Writes an export file off the render thread. Building the SVG/JSON still happens on the
+     * main thread because item/fluid sprite sampling must run under the GL context, but the
+     * directory creation + disk write (and the success/error toast) no longer block a frame.
+     */
+    private static void writeFileAsync(Minecraft mc, Path file, String content, String successKey) {
+        Thread io = new Thread(() -> {
+            try {
+                if (file.getParent() != null) Files.createDirectories(file.getParent());
+                Files.writeString(file, content, StandardCharsets.UTF_8);
+                Component ok = Component.translatable(successKey, file.toString());
+                Minecraft.getInstance().execute(() -> {
+                    overlay(mc, ok);
+                    ClientToast.push(ok);
+                });
+            } catch (Throwable t) {
+                Component err = Component.translatable("recipegraph.export.failed", String.valueOf(t.getMessage()));
+                Minecraft.getInstance().execute(() -> {
+                    overlay(mc, err);
+                    ClientToast.push(err);
+                });
+            }
+        }, "RecipeGraph-Export");
+        io.setDaemon(true);
+        io.start();
+    }
+
     // --- Small helpers ----------------------------------------------------------
 
     private static String f(double d) {
         // 1 decimal digit of precision is enough for SVG paths and keeps files small
         if (d == Math.floor(d)) return Long.toString((long) d);
         return String.format(java.util.Locale.ROOT, "%.1f", d);
+    }
+
+    /**
+     * Combined bounds of module rectangles, recipe cards and every routed edge polyline.
+     * Returned as {minX, minY, maxX, maxY}.
+     */
+    private static double[] exportBounds(LayoutResult layout, PatternGraph g) {
+        double minX = Double.POSITIVE_INFINITY, minY = Double.POSITIVE_INFINITY;
+        double maxX = Double.NEGATIVE_INFINITY, maxY = Double.NEGATIVE_INFINITY;
+        for (ModuleBox b : layout.boxes.values()) {
+            minX = Math.min(minX, b.minX);
+            minY = Math.min(minY, b.minY);
+            maxX = Math.max(maxX, b.maxX);
+            maxY = Math.max(maxY, b.maxY);
+        }
+        for (GraphNode n : g.getNodes()) {
+            minX = Math.min(minX, n.x - n.width / 2.0);
+            minY = Math.min(minY, n.y - n.height / 2.0);
+            maxX = Math.max(maxX, n.x + n.width / 2.0);
+            maxY = Math.max(maxY, n.y + n.height / 2.0);
+        }
+        for (double[] route : layout.routes.values()) {
+            if (route == null) continue;
+            for (int i = 0; i < route.length; i += 2) {
+                minX = Math.min(minX, route[i]);
+                minY = Math.min(minY, route[i + 1]);
+                maxX = Math.max(maxX, route[i]);
+                maxY = Math.max(maxY, route[i + 1]);
+            }
+        }
+        return new double[]{minX, minY, maxX, maxY};
     }
 
     private static String xmlEscape(String s) {

@@ -1,9 +1,7 @@
 package com.zt.recipegraph.layout;
 
-import com.zt.recipegraph.graph.GraphEdge;
-
 import java.util.ArrayList;
-import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -17,11 +15,11 @@ import java.util.Map;
  */
 public final class LayoutResult {
 
-    /** Module rectangles, keyed by module id (merged cluster id). */
-    public final Map<Integer, ModuleBox> boxes = new HashMap<>();
+    /** Module rectangles, keyed by the final module id after renumbering (0..N-1). */
+    public final Map<Integer, ModuleBox> boxes = new LinkedHashMap<>();
 
     /** Orthogonal (or straight) polyline per edge index: [x0,y0, x1,y1, ...]. */
-    public final Map<Integer, double[]> routes = new HashMap<>();
+    public final Map<Integer, double[]> routes = new LinkedHashMap<>();
 
     /** Edges flagged as "back edges" (byproduct return flows routed via top/bottom rails). */
     public final List<Integer> backEdgeIndices = new ArrayList<>();
@@ -59,13 +57,31 @@ public final class LayoutResult {
         return v;
     }
 
-    /** Bottom rail Y for back-edge routing at the given track index (below all boxes). */
-    public double bottomRail(int track) {
-        return getMaxY() + 60 + track * 14.0;
-    }
-
-    /** Top rail Y for back-edge routing at the given track index (above all boxes). */
-    public double topRail(int track) {
-        return getMinY() - 60 - track * 14.0;
+    /**
+     * Bounds of everything actually drawn: module rectangles AND every routed edge
+     * polyline. Bottom rail-return edges run at {@code maxY + 50 + track*14} and channel
+     * segments stick out past box sides, so the box-only bounds (and the node-center
+     * bounds in PatternGraph) crop them on a freshly auto-fitted screen. Used for camera
+     * fitting; the box-only getters above stay for layout internals that position rails
+     * relative to the boxes. Returns {@code [minX, minY, maxX, maxY]}.
+     */
+    public double[] contentBounds() {
+        double minX = Double.POSITIVE_INFINITY, minY = Double.POSITIVE_INFINITY;
+        double maxX = Double.NEGATIVE_INFINITY, maxY = Double.NEGATIVE_INFINITY;
+        for (ModuleBox b : boxes.values()) {
+            minX = Math.min(minX, b.minX);
+            minY = Math.min(minY, b.minY);
+            maxX = Math.max(maxX, b.maxX);
+            maxY = Math.max(maxY, b.maxY);
+        }
+        for (double[] p : routes.values()) {
+            for (int i = 0; i + 1 < p.length; i += 2) {
+                minX = Math.min(minX, p[i]);
+                minY = Math.min(minY, p[i + 1]);
+                maxX = Math.max(maxX, p[i]);
+                maxY = Math.max(maxY, p[i + 1]);
+            }
+        }
+        return new double[]{minX, minY, maxX, maxY};
     }
 }

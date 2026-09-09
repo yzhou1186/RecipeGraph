@@ -20,17 +20,15 @@ import net.neoforged.neoforge.network.registration.PayloadRegistrar;
 public final class PacketHandler {
     private PacketHandler() {}
 
-    public static void init() {
-        // Hooked up by the main mod class via the mod bus; nothing to do at construction time.
-    }
-
     public static void register(IEventBus modBus) {
         modBus.addListener(PacketHandler::onRegister);
     }
 
     private static void onRegister(RegisterPayloadHandlersEvent event) {
         PayloadRegistrar registrar = event.registrar(RecipeGraphMod.MOD_ID)
-            .versioned("1")
+            // Bumped for the 0.4 wire change: GraphDataPacket now carries containerId,
+            // generation and a string dictionary instead of raw repeated strings.
+            .versioned("2")
             .optional();
 
         registrar.playToClient(

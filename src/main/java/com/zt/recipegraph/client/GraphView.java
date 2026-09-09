@@ -38,12 +38,24 @@ public final class GraphView {
         this.fitH = h;
     }
 
-    public void setGraph(PatternGraph g) {
+    /**
+     * Installs a new graph with a PRE-COMPUTED layout (produced by the background layout
+     * worker in ClientGraphState). Falls back to a synchronous relayout when no layout is
+     * available (e.g. an empty graph, or a snapshot published without one).
+     */
+    public void setGraph(PatternGraph g, LayoutResult precomputed) {
         this.graph = g;
-        relayout();
+        if (precomputed != null) {
+            layout = precomputed;
+            graph.recomputeBounds();
+            rebuildBoxesCache();
+            fitCamera();
+        } else {
+            relayout();
+        }
     }
 
-    /** Runs the hierarchical layout and fits the camera to the graph. */
+    /** Runs the hierarchical layout synchronously and fits the camera to the graph. */
     public void relayout() {
         if (graph == null || graph.isEmpty()) {
             layout = new LayoutResult();
@@ -53,15 +65,29 @@ public final class GraphView {
         layout = new HierarchicalLayout(graph).run();
         graph.recomputeBounds();
         rebuildBoxesCache();
+        fitCamera();
+    }
 
-        double cx = (graph.getMinX() + graph.getMaxX()) * 0.5;
-        double cy = (graph.getMinY() + graph.getMaxY()) * 0.5;
+    /**
+     * Centers the camera on the laid-out content and auto-fits the zoom to the viewport.
+     * Uses the layout's FULL content bounds (module boxes AND edge routes — bottom
+     * loop-return rails run well below the boxes and channel segments stick out at the
+     * sides); node-center bounds would crop them on the initial view.
+     */
+    private void fitCamera() {
+        if (graph == null || graph.isEmpty()) return;
+        double[] b = layout.contentBounds();
+        double minX = b[0], minY = b[1], maxX = b[2], maxY = b[3];
+        if (!Double.isFinite(minX) || !Double.isFinite(maxX)) return;
+        double cx = (minX + maxX) * 0.5;
+        double cy = (minY + maxY) * 0.5;
         panX = -cx;
         panY = -cy;
         if (fitW > 0 && fitH > 0) {
-            double gw = Math.max(1.0, graph.getMaxX() - graph.getMinX());
-            double gh = Math.max(1.0, graph.getMaxY() - graph.getMinY());
-            double z = Math.min(fitW / (gw + 260.0), fitH / (gh + 260.0));
+            double gw = Math.max(1.0, maxX - minX);
+            double gh = Math.max(1.0, maxY - minY);
+            // padding keeps the outermost port chips and rail stubs off the screen edge
+            double z = Math.min(fitW / (gw + 160.0), fitH / (gh + 160.0));
             zoom = Math.max(0.05, Math.min(1.2, z));
         }
     }

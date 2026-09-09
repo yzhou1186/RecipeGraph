@@ -9,6 +9,7 @@ import com.zt.recipegraph.menus.GraphTerminalMenu;
 import com.zt.recipegraph.network.GraphDataPacket;
 
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.HolderLookup;
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.InteractionHand;
@@ -39,12 +40,18 @@ import java.util.Map;
  *
  * When the player right-clicks the block:
  *   1. The menu is opened server-side (which sends the open-screen packet to the client).
- *   2. The graph is collected server-side (PatternCollector + Louvain clustering).
- *   3. It is sent to the client as a {@link GraphDataPacket}; the hierarchical layout
- *      (module boxes, Sugiyama, orthogonal routing) runs on the client.
+ *   2. {@link #sendGraph} enumerates patterns via the AE2 grid/provider/crafting services
+ *      on the main thread (AE2 grid state must never be read off-thread), then builds the
+ *      recipe graph and runs Louvain clustering on a worker thread from the immutable
+ *      pattern snapshot (large modpacks can hold thousands of patterns — doing this
+ *      synchronously would stall the server tick).
+ *   3. The worker hands the finished packet back to the server thread via
+ *      {@code executeIfPossible}, where diagnostics are logged and the packet is sent.
  *
- * Because (1) and (3) are sent in that order on the same tick, the client is guaranteed to
- * have created the screen before the graph packet arrives.
+ * The graph packet may therefore arrive a tick or two AFTER the screen opens; the client
+ * screen polls {@link com.zt.recipegraph.client.ClientGraphState} every tick and shows the
+ * graph as soon as it lands. The hierarchical layout (module boxes, Sugiyama, orthogonal
+ * routing) runs on the client, also off the render thread.
  */
 public class GraphTerminalBlock extends Block implements EntityBlock {
     public GraphTerminalBlock(BlockBehaviour.Properties props) {
@@ -88,87 +95,181 @@ public class GraphTerminalBlock extends Block implements EntityBlock {
                 }
             }, buf -> buf.writeBlockPos(pos));
 
-            // 2. Build the graph and send it
-            sendGraph(serverPlayer, level, pos);
+            // 2. Build the graph and send it. openMenu() installs the new menu on the
+            // player synchronously, so its container id is the generation-0 request target.
+            if (serverPlayer.containerMenu instanceof GraphTerminalMenu terminalMenu) {
+                sendGraph(serverPlayer, level, pos, terminalMenu.containerId, terminalMenu.getGeneration());
+            }
         }
         return InteractionResult.sidedSuccess(level.isClientSide);
     }
 
     /**
      * Collect + send the pattern graph. Reads patterns only from the AE2 network this
-     * terminal is attached to. The server only gathers patterns and runs Louvain
-     * community detection; the hierarchical layout (module boxes, Sugiyama, orthogonal
-     * routing) is computed on the client.
+     * terminal is attached to.
+     *
+     * <p>Threading: ALL AE2 grid queries happen synchronously on the calling (main) thread —
+     * grid/provider/service references, the provider pattern enumeration and the
+     * crafting-service craftable enumeration are resolved there into an immutable pattern
+     * snapshot. The worker thread only extracts data from those patterns (ports, SNBT key
+     * ids) and runs Louvain clustering; the finished packet is handed back to the server
+     * thread via {@code executeIfPossible} for logging and sending. Collection can take
+     * hundreds of milliseconds on large modpacks and the heavy work must never run on the
+     * server tick thread, while grid nodes/services must never be queried off-thread.</p>
      */
-    public static void sendGraph(ServerPlayer player, Level level, BlockPos pos) {
+    public static void sendGraph(ServerPlayer player, Level level, BlockPos pos, int containerId, int generation) {
+        // --- main thread: capture AE2 references AND enumerate every readable pattern ---
+        // AE2 grid nodes/services must not be queried off-thread, so the provider and
+        // crafting-service enumeration happens HERE; the worker only parses the immutable
+        // pattern snapshot into graph nodes/ports and runs clustering.
         appeng.api.networking.IGrid grid = null;
         appeng.api.networking.IGridNode node = null;
+        List<PatternCollector.ProviderEntry> providerSnapshot = List.of();
+        appeng.api.networking.crafting.ICraftingService craftingService = null;
+        HolderLookup.Provider registries = level != null ? level.registryAccess() : null;
         if (level.getBlockEntity(pos) instanceof GraphTerminalBlockEntity terminal) {
             node = terminal.getMainNode().getNode();
             grid = terminal.getGrid();
-        }
-
-        PatternCollector collector = new PatternCollector(grid);
-        PatternGraph graph = collector.collect();
-        if (!graph.isEmpty()) {
-            new com.zt.recipegraph.clustering.LouvainClustering(graph).run();
-        }
-
-        // --- diagnostics (server log): pinpoints where the AE2 chain breaks ---
-        if (node == null) {
-            RecipeGraphMod.LOGGER.info("[GraphTerminal] {} no grid node (not created yet?)", pos);
-        } else {
-            RecipeGraphMod.LOGGER.info(
-                "[GraphTerminal] {} node#{} grid={} booted={} active={} channels={}/{} connectedSides={} providers={} craftables={} patterns={} graphNodes={} graphEdges={}",
-                pos, node.hashCode(), grid != null, node.hasGridBooted(), node.isActive(),
-                node.getUsedChannels(), node.getMaxChannels(), node.getConnectedSides(),
-                collector.getProviderCount(),
-                collector.getCraftableCount(), collector.getPatternCount(),
-                graph.getNodeCount(), graph.getEdgeCount());
-            if (!collector.getProviderDetails().isEmpty()) {
-                RecipeGraphMod.LOGGER.info("[GraphTerminal] providers: {}",
-                    String.join(", ", collector.getProviderDetails()));
+            if (grid != null) {
+                providerSnapshot = new ArrayList<>();
+                for (appeng.api.networking.IGridNode n : grid.getNodes()) {
+                    appeng.api.networking.crafting.ICraftingProvider provider = null;
+                    try {
+                        provider = n.getService(appeng.api.networking.crafting.ICraftingProvider.class);
+                    } catch (Throwable ignored) {}
+                    if (provider == null && n.getOwner() instanceof appeng.api.networking.crafting.ICraftingProvider owner) {
+                        provider = owner;
+                    }
+                    if (provider != null) {
+                        String ownerName = n.getOwner() == null
+                            ? provider.getClass().getSimpleName()
+                            : n.getOwner().getClass().getSimpleName();
+                        providerSnapshot.add(new PatternCollector.ProviderEntry(provider, ownerName));
+                    }
+                }
+                craftingService = grid.getCraftingService();
             }
         }
 
-        int status;
-        if (grid == null) {
-            status = GraphDataPacket.STATUS_NO_NETWORK;
-        } else if (graph.isEmpty()) {
-            status = GraphDataPacket.STATUS_NO_PATTERNS;
-        } else {
-            status = GraphDataPacket.STATUS_OK;
+        // enumerate patterns on the main thread: direct ICraftingProvider nodes first
+        // (vanilla providers, ME interfaces, addon devices), then the crafting-service
+        // fallback as a union; deduplicate by identity into an insertion-ordered snapshot.
+        java.util.Set<appeng.api.crafting.IPatternDetails> patternSet = new java.util.LinkedHashSet<>();
+        List<String> providerDetails = new ArrayList<>();
+        int providers = 0;
+        for (PatternCollector.ProviderEntry entry : providerSnapshot) {
+            List<appeng.api.crafting.IPatternDetails> patterns = null;
+            try {
+                patterns = entry.provider().getAvailablePatterns();
+            } catch (Throwable ignored) {}
+            if (patterns == null || patterns.isEmpty()) continue;
+            providers++;
+            providerDetails.add(entry.ownerName() + ":" + patterns.size());
+            patternSet.addAll(patterns);
         }
+        int craftables = 0;
+        if (craftingService != null) {
+            for (appeng.api.stacks.AEKey craftable : craftingService.getCraftables(key -> true)) {
+                craftables++;
+                try {
+                    patternSet.addAll(craftingService.getCraftingFor(craftable));
+                } catch (Throwable ignored) {}
+            }
+        }
+        List<appeng.api.crafting.IPatternDetails> patternSnapshot = List.copyOf(patternSet);
 
-        List<GraphDataPacket.NodeData> nodes = new ArrayList<>(graph.getNodeCount());
-        for (GraphNode n : graph.getNodes()) {
-            // positions are computed client-side; only ids, labels, cluster ids and ports travel
-            List<String> inKeys = new ArrayList<>();
-            List<String> inLabels = new ArrayList<>();
-            for (com.zt.recipegraph.graph.Port p : n.getInputs()) {
-                inKeys.add(p.keyId);
-                inLabels.add(p.keyLabel);
+        final appeng.api.networking.IGrid fGrid = grid;
+        final appeng.api.networking.IGridNode fNode = node;
+        final int fProviderCount = providers;
+        final int fCraftableCount = craftables;
+        final List<String> fProviderDetails = List.copyOf(providerDetails);
+        final List<appeng.api.crafting.IPatternDetails> fPatternSnapshot = patternSnapshot;
+        final ServerPlayer fPlayer = player;
+        final int fContainerId = containerId;
+        final int fGeneration = generation;
+        final HolderLookup.Provider fRegistries = registries;
+
+        Thread worker = new Thread(() -> {
+            try {
+                PatternCollector collector = new PatternCollector(
+                    fPatternSnapshot, fProviderCount, fCraftableCount, fProviderDetails, fRegistries);
+                PatternGraph graph = collector.collect();
+                if (!graph.isEmpty()) {
+                    new com.zt.recipegraph.clustering.LouvainClustering(graph).run();
+                }
+
+                int status;
+                if (fGrid == null) {
+                    status = GraphDataPacket.STATUS_NO_NETWORK;
+                } else if (graph.isEmpty()) {
+                    status = GraphDataPacket.STATUS_NO_PATTERNS;
+                } else {
+                    status = GraphDataPacket.STATUS_OK;
+                }
+
+                // positions are computed client-side; only ids, labels, cluster ids and ports travel
+                List<GraphDataPacket.NodeData> nodes = new ArrayList<>(graph.getNodeCount());
+                for (GraphNode n : graph.getNodes()) {
+                    List<String> inKeys = new ArrayList<>();
+                    List<String> inLabels = new ArrayList<>();
+                    for (com.zt.recipegraph.graph.Port p : n.getInputs()) {
+                        inKeys.add(p.keyId);
+                        inLabels.add(p.keyLabel);
+                    }
+                    List<String> outKeys = new ArrayList<>();
+                    List<String> outLabels = new ArrayList<>();
+                    for (com.zt.recipegraph.graph.Port p : n.getOutputs()) {
+                        outKeys.add(p.keyId);
+                        outLabels.add(p.keyLabel);
+                    }
+                    nodes.add(new GraphDataPacket.NodeData(n.getId(), n.getLabel(), 0, 0, n.getCluster(),
+                        inKeys, inLabels, outKeys, outLabels));
+                }
+                List<GraphDataPacket.EdgeData> edges = new ArrayList<>(graph.getEdgeCount());
+                for (GraphEdge e : graph.getEdges()) {
+                    edges.add(new GraphDataPacket.EdgeData(
+                        e.getFrom().getId(), e.getTo().getId(), e.getKeyId()));
+                }
+                GraphDataPacket pkt = new GraphDataPacket(
+                    fContainerId,
+                    fGeneration,
+                    status,
+                    Math.max(0, collector.getPatternCount()),
+                    nodes, edges);
+
+                var server = fPlayer.getServer();
+                if (server == null) return;
+
+                // --- back on the server thread: diagnostics + send ---
+                server.executeIfPossible(() -> {
+                    if (fNode == null) {
+                        RecipeGraphMod.LOGGER.info("[GraphTerminal] {} no grid node (not created yet?)", pos);
+                    } else {
+                        RecipeGraphMod.LOGGER.info(
+                            "[GraphTerminal] {} node#{} grid={} booted={} active={} channels={}/{} connectedSides={} providers={} craftables={} patterns={} graphNodes={} graphEdges={}",
+                            pos, fNode.hashCode(), fGrid != null, fNode.hasGridBooted(), fNode.isActive(),
+                            fNode.getUsedChannels(), fNode.getMaxChannels(), fNode.getConnectedSides(),
+                            collector.getProviderCount(),
+                            collector.getCraftableCount(), collector.getPatternCount(),
+                            graph.getNodeCount(), graph.getEdgeCount());
+                        if (!collector.getProviderDetails().isEmpty()) {
+                            RecipeGraphMod.LOGGER.info("[GraphTerminal] providers: {}",
+                                String.join(", ", collector.getProviderDetails()));
+                        }
+                    }
+                    PacketDistributor.sendToPlayer(fPlayer, pkt);
+                });
+            } catch (Throwable t) {
+                RecipeGraphMod.LOGGER.error("[GraphTerminal] {} graph collection failed", pos, t);
+                // Never leave the client waiting forever: report an explicit error status.
+                var server = fPlayer.getServer();
+                if (server != null) {
+                    server.executeIfPossible(() -> PacketDistributor.sendToPlayer(fPlayer, new GraphDataPacket(
+                        fContainerId, fGeneration, GraphDataPacket.STATUS_ERROR, -1, List.of(), List.of())));
+                }
             }
-            List<String> outKeys = new ArrayList<>();
-            List<String> outLabels = new ArrayList<>();
-            for (com.zt.recipegraph.graph.Port p : n.getOutputs()) {
-                outKeys.add(p.keyId);
-                outLabels.add(p.keyLabel);
-            }
-            nodes.add(new GraphDataPacket.NodeData(n.getId(), n.getLabel(), 0, 0, n.getCluster(),
-                inKeys, inLabels, outKeys, outLabels));
-        }
-        List<GraphDataPacket.EdgeData> edges = new ArrayList<>(graph.getEdgeCount());
-        for (GraphEdge e : graph.getEdges()) {
-            edges.add(new GraphDataPacket.EdgeData(
-                e.getFrom().getId(), e.getTo().getId(), e.getKeyId()));
-        }
-        GraphDataPacket pkt = new GraphDataPacket(
-            status,
-            Math.max(0, collector.getPatternCount()),
-            nodes, edges,
-            graph.getMinX(), graph.getMaxX(), graph.getMinY(), graph.getMaxY()
-        );
-        PacketDistributor.sendToPlayer(player, pkt);
+        }, "RecipeGraph-Collector");
+        worker.setDaemon(true);
+        worker.start();
     }
 }
